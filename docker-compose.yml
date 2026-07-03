@@ -69,11 +69,9 @@ services:
     ports:
       - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
-      - "127.0.0.1:"${OPENCLAW_MSTEAMS_PORT:-3978}:3978"
+      - "127.0.0.1:${OPENCLAW_MSTEAMS_PORT:-3978}:3978"
     init: true
     restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
     # Note: Docker applies default seccomp + AppArmor profiles automatically.
     # For stricter hardening, create a custom seccomp profile:
     # seccomp: /path/to/custom-seccomp.json
