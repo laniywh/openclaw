@@ -254,6 +254,22 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
         docker-ce-cli docker-compose-plugin; \
     fi
 
+# Gmail CLI (GOG) — pinned version with SHA256 verification.
+# Requires GOG_KEYRING_PASSWORD at runtime for keyring persistence (set in
+# docker-compose env or .env).
+# Source: https://github.com/steipete/gogcli
+#
+# To update, get the new checksum:
+#   curl -sL https://github.com/steipete/gogcli/releases/download/v<VERSION>/gogcli_<VERSION>_linux_arm64.tar.gz | sha256sum
+ARG GOG_VERSION="0.12.0"
+ARG GOG_SHA256="d7f20494d7eb0e8716631853d055ccbb368c7b81cb8165f55b45884bccb67b4b"
+RUN curl -fsSL -o /tmp/gog.tar.gz \
+      "https://github.com/steipete/gogcli/releases/download/v${GOG_VERSION}/gogcli_${GOG_VERSION}_linux_arm64.tar.gz" && \
+    echo "${GOG_SHA256}  /tmp/gog.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/gog.tar.gz -C /usr/local/bin gog && \
+    chmod +x /usr/local/bin/gog && \
+    rm -f /tmp/gog.tar.gz
+
 # Expose the CLI binary without requiring npm global writes as non-root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
  && chmod 755 /app/openclaw.mjs
@@ -280,3 +296,4 @@ USER node
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+

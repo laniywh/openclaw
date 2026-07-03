@@ -1,6 +1,9 @@
 services:
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -9,6 +12,10 @@ services:
       CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY:-}
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
+      GOG_KEYRING_BACKEND: ${GOG_KEYRING_BACKEND}
+      GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD}
+      GOG_ACCOUNT: ${GOG_ACCOUNT}
+      XDG_CONFIG_HOME: ${XDG_CONFIG_HOME}
       TZ: ${OPENCLAW_TZ:-UTC}
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
@@ -22,10 +29,27 @@ services:
     # group_add:
     #   - "${DOCKER_GID:-999}"
     ports:
-      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
-      - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+      - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
     init: true
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Note: Docker applies default seccomp + AppArmor profiles automatically.
+    # For stricter hardening, create a custom seccomp profile:
+    # seccomp: /path/to/custom-seccomp.json
+    # See: https://docs.docker.com/engine/security/seccomp/
+    mem_limit: "1g"
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     command:
       [
         "node",
@@ -35,6 +59,7 @@ services:
         "${OPENCLAW_GATEWAY_BIND:-lan}",
         "--port",
         "18789",
+        "--allow-unconfigured",
       ]
     healthcheck:
       test:
@@ -76,3 +101,4 @@ services:
     entrypoint: ["node", "dist/index.js"]
     depends_on:
       - openclaw-gateway
+
