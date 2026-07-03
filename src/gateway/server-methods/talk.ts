@@ -1,39 +1,70 @@
-import { loadConfig, readConfigFileSnapshot } from "../../config/config.js";
+// Gateway RPC handlers for Talk voice, transcription, and speech synthesis surfaces.
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import {
+  ErrorCodes,
+  errorShape,
+  formatValidationErrors,
+  type TalkSpeakParams,
+  validateTalkCatalogParams,
+  validateTalkConfigParams,
+  validateTalkModeParams,
+  validateTalkSpeakParams,
+} from "../../../packages/gateway-protocol/src/index.js";
+import {
+  withSpeakerSelectionCompat,
+  withSpeakerSelectionFallbackCompat,
+} from "../../../packages/speech-core/speaker.js";
+import { getVoiceProviderConfig } from "../../../packages/speech-core/voice-models.js";
+import { readConfigFileSnapshot } from "../../config/config.js";
 import { redactConfigObject } from "../../config/redact-snapshot.js";
 import {
   buildTalkConfigResponse,
   normalizeTalkSection,
   resolveActiveTalkProviderConfig,
 } from "../../config/talk.js";
-import type { TalkConfigResponse, TalkProviderConfig } from "../../config/types.gateway.js";
+import type {
+  TalkConfigResponse,
+  TalkProviderConfig,
+  TalkRealtimeConfig,
+} from "../../config/types.gateway.js";
 import type { OpenClawConfig, TtsConfig, TtsProviderConfigMap } from "../../config/types.js";
+import { resolveProviderRawConfig } from "../../plugin-sdk/provider-selection-runtime.js";
 import {
-  REALTIME_VOICE_AGENT_CONSULT_TOOL,
-  REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
-} from "../../realtime-voice/agent-consult-tool.js";
-import { getRealtimeVoiceProvider } from "../../realtime-voice/provider-registry.js";
-import { resolveConfiguredRealtimeVoiceProvider } from "../../realtime-voice/provider-resolver.js";
-import type { RealtimeVoiceProviderConfig } from "../../realtime-voice/provider-types.js";
+  canonicalizeRealtimeTranscriptionProviderId,
+  listRealtimeTranscriptionProviders,
+} from "../../realtime-transcription/provider-registry.js";
 import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "../../shared/string-coerce.js";
-import { canonicalizeSpeechProviderId, getSpeechProvider } from "../../tts/provider-registry.js";
-import { synthesizeSpeech, type TtsDirectiveOverrides } from "../../tts/tts.js";
+  canonicalizeRealtimeVoiceProviderId,
+  listRealtimeVoiceProviders,
+} from "../../talk/provider-registry.js";
+import { resolveConfiguredRealtimeVoiceProvider } from "../../talk/provider-resolver.js";
+import {
+  canonicalizeSpeechProviderId,
+  getSpeechProvider,
+  listSpeechProviders,
+} from "../../tts/provider-registry.js";
+import {
+  getResolvedSpeechProviderConfig,
+  resolveTtsConfig,
+  synthesizeSpeech,
+  type TtsDirectiveOverrides,
+} from "../../tts/tts.js";
 import { ADMIN_SCOPE, TALK_SECRETS_SCOPE } from "../operator-scopes.js";
-import {
-  ErrorCodes,
-  errorShape,
-  formatValidationErrors,
-  type TalkSpeakParams,
-  validateTalkConfigParams,
-  validateTalkModeParams,
-  validateTalkRealtimeSessionParams,
-  validateTalkSpeakParams,
-} from "../protocol/index.js";
+import { resolveConfiguredSecretInputString } from "../resolve-configured-secret-input-string.js";
 import { formatForLog } from "../ws-log.js";
-import { asRecord } from "./record-shared.js";
+import { talkClientHandlers } from "./talk-client.js";
+import { talkSessionHandlers } from "./talk-session.js";
+import {
+  buildTalkRealtimeConfig,
+  buildTalkTranscriptionConfig,
+  configuredOrFalse,
+  resolveConfiguredRealtimeTranscriptionProvider,
+} from "./talk-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
 type TalkSpeakReason =
@@ -47,13 +78,33 @@ type TalkSpeakErrorDetails = {
   reason: TalkSpeakReason;
   fallbackEligible: boolean;
 };
+
+function resolveCatalogProviderSelection(
+  configuredProvider: string | undefined,
+  resolveAutomaticProvider: () => string,
+): { activeProvider?: string; ready: boolean } {
+  // Provider priority belongs to the runtime resolver; catalog consumers must not infer it from row order.
+  try {
+    const resolvedProvider = resolveAutomaticProvider();
+    return {
+      activeProvider: resolvedProvider,
+      ready: true,
+    };
+  } catch {
+    return {
+      ...(configuredProvider ? { activeProvider: configuredProvider } : {}),
+      ready: false,
+    };
+  }
+}
+
 function canReadTalkSecrets(client: { connect?: { scopes?: string[] } } | null): boolean {
   const scopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
   return scopes.includes(ADMIN_SCOPE) || scopes.includes(TALK_SECRETS_SCOPE);
 }
 
 function asStringRecord(value: unknown): Record<string, string> | undefined {
-  const record = asRecord(value);
+  const record = asOptionalRecord(value);
   if (!record) {
     return undefined;
   }
@@ -90,6 +141,31 @@ function resolveTalkVoiceId(
   return requested;
 }
 
+function withTalkBaseTtsSpeakerSelectionCompat(
+  baseTts: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = withSpeakerSelectionCompat(baseTts);
+  const providers = asOptionalRecord(baseTts.providers);
+  if (providers) {
+    next.providers = Object.fromEntries(
+      Object.entries(providers).map(([providerId, providerConfig]) => [
+        providerId,
+        withSpeakerSelectionCompat(asOptionalRecord(providerConfig) ?? {}),
+      ]),
+    );
+  }
+  for (const [key, value] of Object.entries(baseTts)) {
+    if (key === "providers") {
+      continue;
+    }
+    const record = asOptionalRecord(value);
+    if (record) {
+      next[key] = withSpeakerSelectionCompat(record);
+    }
+  }
+  return next;
+}
+
 function buildTalkTtsConfig(
   config: OpenClawConfig,
 ):
@@ -112,8 +188,10 @@ function buildTalkTtsConfig(
     };
   }
 
-  const baseTts = config.messages?.tts ?? {};
-  const providerConfig = resolved.config;
+  const baseTts = withTalkBaseTtsSpeakerSelectionCompat(
+    asOptionalRecord(config.messages?.tts) ?? {},
+  ) as TtsConfig;
+  const providerConfig = withSpeakerSelectionFallbackCompat(resolved.config);
   const resolvedProviderConfig =
     speechProvider.resolveTalkConfig?.({
       cfg: config,
@@ -126,7 +204,7 @@ function buildTalkTtsConfig(
     auto: "always",
     provider,
     providers: {
-      ...((asRecord(baseTts.providers) ?? {}) as TtsProviderConfigMap),
+      ...((asOptionalRecord(baseTts.providers) ?? {}) as TtsProviderConfigMap),
       [provider]: resolvedProviderConfig,
     },
   };
@@ -144,59 +222,166 @@ function buildTalkTtsConfig(
   };
 }
 
-function getRecord(value: unknown): Record<string, unknown> | undefined {
-  return asRecord(value) ?? undefined;
-}
+function buildTalkCatalog(config: OpenClawConfig) {
+  const ttsConfig = resolveTtsConfig(config);
+  const talkResolved = resolveActiveTalkProviderConfig(config.talk);
+  const activeSpeechProvider = canonicalizeSpeechProviderId(talkResolved?.provider, config);
+  const transcriptionConfig = buildTalkTranscriptionConfig(config);
+  const transcriptionSelection = resolveCatalogProviderSelection(
+    canonicalizeRealtimeTranscriptionProviderId(transcriptionConfig.provider, config),
+    () =>
+      resolveConfiguredRealtimeTranscriptionProvider({
+        config,
+        configuredProviderId: transcriptionConfig.provider,
+        providerConfigs: transcriptionConfig.providers,
+        defaultModel: transcriptionConfig.model,
+      }).provider.id,
+  );
+  const activeTranscriptionProvider = transcriptionSelection.activeProvider;
+  const realtimeConfig = buildTalkRealtimeConfig(config);
+  const realtimeSelection = resolveCatalogProviderSelection(
+    canonicalizeRealtimeVoiceProviderId(realtimeConfig.provider, config),
+    () =>
+      resolveConfiguredRealtimeVoiceProvider({
+        cfg: config,
+        configuredProviderId: realtimeConfig.provider,
+        providerConfigs: realtimeConfig.providers,
+        defaultModel: realtimeConfig.model,
+      }).provider.id,
+  );
+  const activeRealtimeProvider = realtimeSelection.activeProvider;
 
-function getVoiceCallRealtimeConfig(config: OpenClawConfig): {
-  provider?: string;
-  providers?: Record<string, RealtimeVoiceProviderConfig>;
-} {
-  const plugins = getRecord(config.plugins);
-  const entries = getRecord(plugins?.entries);
-  const voiceCall = getRecord(entries?.["voice-call"]);
-  const pluginConfig = getRecord(voiceCall?.config);
-  const realtime = getRecord(pluginConfig?.realtime);
-  const providersRaw = getRecord(realtime?.providers);
-  const providers: Record<string, RealtimeVoiceProviderConfig> = {};
-  if (providersRaw) {
-    for (const [providerId, providerConfig] of Object.entries(providersRaw)) {
-      const record = getRecord(providerConfig);
-      if (record) {
-        providers[providerId] = record;
-      }
-    }
-  }
   return {
-    provider: normalizeOptionalString(realtime?.provider),
-    providers: Object.keys(providers).length > 0 ? providers : undefined,
-  };
-}
-
-function buildTalkRealtimeConfig(config: OpenClawConfig, requestedProvider?: string) {
-  const voiceCallRealtime = getVoiceCallRealtimeConfig(config);
-  const talkProviderConfigs = config.talk?.providers as
-    | Record<string, RealtimeVoiceProviderConfig>
-    | undefined;
-  const talkProvider = normalizeOptionalString(config.talk?.provider);
-  const talkProviderSupportsRealtime = talkProvider
-    ? Boolean(getRealtimeVoiceProvider(talkProvider, config))
-    : false;
-  const provider =
-    normalizeOptionalString(requestedProvider) ??
-    (talkProviderSupportsRealtime ? talkProvider : undefined) ??
-    voiceCallRealtime.provider;
-  return {
-    provider,
-    providers: {
-      ...voiceCallRealtime.providers,
-      ...talkProviderConfigs,
+    modes: ["realtime", "stt-tts", "transcription"],
+    transports: ["webrtc", "provider-websocket", "gateway-relay", "managed-room"],
+    brains: ["agent-consult", "direct-tools", "none"],
+    speech: {
+      ...(activeSpeechProvider ? { activeProvider: activeSpeechProvider } : {}),
+      providers: listSpeechProviders(config).map((provider) => {
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({
+              cfg: config,
+              providerConfig: getResolvedSpeechProviderConfig(ttsConfig, provider.id, config),
+              timeoutMs: ttsConfig.timeoutMs,
+            }),
+          ),
+          modes: ["stt-tts"],
+          brains: ["agent-consult"],
+        };
+        if (provider.models) {
+          entry.models = [...provider.models];
+        }
+        if (provider.aliases?.length) {
+          entry.aliases = [...provider.aliases];
+        }
+        if (provider.voices) {
+          entry.voices = [...provider.voices];
+        }
+        return entry;
+      }),
+    },
+    transcription: {
+      ready: transcriptionSelection.ready,
+      ...(activeTranscriptionProvider ? { activeProvider: activeTranscriptionProvider } : {}),
+      providers: listRealtimeTranscriptionProviders(config).map((provider) => {
+        const rawConfig = getVoiceProviderConfig({
+          providerConfigs: transcriptionConfig.providers,
+          provider,
+          configuredProviderId:
+            provider.id === activeTranscriptionProvider ? transcriptionConfig.provider : undefined,
+        });
+        const rawConfigWithModel =
+          transcriptionConfig.model && rawConfig.model === undefined
+            ? { ...rawConfig, model: transcriptionConfig.model }
+            : rawConfig;
+        const providerConfig =
+          provider.resolveConfig?.({ cfg: config, rawConfig: rawConfigWithModel }) ??
+          rawConfigWithModel;
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({ cfg: config, providerConfig }),
+          ),
+          modes: ["transcription"],
+          transports: ["gateway-relay"],
+          brains: ["none"],
+        };
+        if (provider.defaultModel) {
+          entry.defaultModel = provider.defaultModel;
+        }
+        if (provider.aliases?.length) {
+          entry.aliases = [...provider.aliases];
+        }
+        return entry;
+      }),
+    },
+    realtime: {
+      ready: realtimeSelection.ready,
+      ...(activeRealtimeProvider ? { activeProvider: activeRealtimeProvider } : {}),
+      providers: listRealtimeVoiceProviders(config).map((provider) => {
+        const rawConfig = resolveProviderRawConfig({
+          providerConfigs: realtimeConfig.providers ?? {},
+          providerId: provider.id,
+          configuredProviderId:
+            provider.id === activeRealtimeProvider ? realtimeConfig.provider : undefined,
+        });
+        const rawConfigWithModel =
+          realtimeConfig.model && rawConfig.model === undefined
+            ? { ...rawConfig, model: realtimeConfig.model }
+            : rawConfig;
+        const providerConfig =
+          provider.resolveConfig?.({ cfg: config, rawConfig: rawConfigWithModel }) ??
+          rawConfigWithModel;
+        const capabilities = provider.capabilities;
+        const entry: Record<string, unknown> = {
+          id: provider.id,
+          label: provider.label,
+          configured: configuredOrFalse(() =>
+            provider.isConfigured({ cfg: config, providerConfig }),
+          ),
+          modes: ["realtime"],
+          brains: capabilities?.supportsToolCalls === false ? ["none"] : ["agent-consult"],
+          supportsBrowserSession: Boolean(
+            capabilities?.supportsBrowserSession ?? provider.createBrowserSession,
+          ),
+        };
+        if (provider.defaultModel) {
+          entry.defaultModel = provider.defaultModel;
+        }
+        if (provider.aliases?.length) {
+          entry.aliases = [...provider.aliases];
+        }
+        if (capabilities?.transports) {
+          entry.transports = [...capabilities.transports];
+        }
+        if (capabilities?.inputAudioFormats) {
+          entry.inputAudioFormats = capabilities.inputAudioFormats.map((format) => ({ ...format }));
+        }
+        if (capabilities?.outputAudioFormats) {
+          entry.outputAudioFormats = capabilities.outputAudioFormats.map((format) => ({
+            ...format,
+          }));
+        }
+        if (capabilities?.supportsBargeIn !== undefined) {
+          entry.supportsBargeIn = capabilities.supportsBargeIn;
+        }
+        if (capabilities?.supportsToolCalls !== undefined) {
+          entry.supportsToolCalls = capabilities.supportsToolCalls;
+        }
+        if (capabilities?.supportsVideoFrames !== undefined) {
+          entry.supportsVideoFrames = capabilities.supportsVideoFrames;
+        }
+        if (capabilities?.supportsSessionResumption !== undefined) {
+          entry.supportsSessionResumption = capabilities.supportsSessionResumption;
+        }
+        return entry;
+      }),
     },
   };
-}
-
-function buildRealtimeInstructions(): string {
-  return `You are OpenClaw's realtime voice interface. Keep spoken replies concise. If the user asks for code, repository state, tools, files, current OpenClaw context, or deeper reasoning, call ${REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME} and then summarize the result naturally.`;
 }
 
 function isFallbackEligibleTalkReason(reason: TalkSpeakReason): boolean {
@@ -223,7 +408,7 @@ function resolveTalkSpeed(params: TalkSpeakParams): number | undefined {
     return undefined;
   }
   const resolved = params.rateWpm / 175;
-  if (resolved <= 0.5 || resolved >= 2.0) {
+  if (resolved <= 0.5 || resolved >= 2) {
     return undefined;
   }
   return resolved;
@@ -294,24 +479,53 @@ function inferMimeType(
   return undefined;
 }
 
-function resolveTalkResponseFromConfig(params: {
+async function resolveTalkResponseFromConfig(params: {
   includeSecrets: boolean;
   sourceConfig: OpenClawConfig;
   runtimeConfig: OpenClawConfig;
-}): TalkConfigResponse | undefined {
+}): Promise<TalkConfigResponse | undefined> {
   const normalizedTalk = normalizeTalkSection(params.sourceConfig.talk);
-  if (!normalizedTalk) {
+  const configuredPayload = normalizedTalk ? buildTalkConfigResponse(normalizedTalk) : undefined;
+  // Resolve provider selection from materialized config, but project provider-owned fields from
+  // source config so SecretRefs stay redacted. The requested provider also avoids re-resolving them.
+  const runtimeRealtime = buildTalkRealtimeConfig(params.runtimeConfig);
+  const effectiveProvider = canonicalizeRealtimeVoiceProviderId(
+    runtimeRealtime.provider,
+    params.runtimeConfig,
+  );
+  const sourceRealtime = buildTalkRealtimeConfig(params.sourceConfig, effectiveProvider);
+  const sourceProviders: Record<string, TalkProviderConfig> = {};
+  for (const [providerId, providerConfig] of Object.entries(sourceRealtime.providers)) {
+    const canonicalProviderId =
+      canonicalizeRealtimeVoiceProviderId(providerId, params.runtimeConfig) ?? providerId;
+    sourceProviders[canonicalProviderId] = {
+      ...sourceProviders[canonicalProviderId],
+      ...providerConfig,
+    };
+  }
+  const effectiveRealtime = normalizeTalkSection({
+    realtime: {
+      ...(effectiveProvider ? { provider: effectiveProvider } : {}),
+      ...(runtimeRealtime.model ? { model: runtimeRealtime.model } : {}),
+      ...(Object.keys(sourceProviders).length > 0 ? { providers: sourceProviders } : {}),
+    },
+  })?.realtime;
+  if (!configuredPayload && !effectiveRealtime) {
     return undefined;
   }
-
-  const payload = buildTalkConfigResponse(normalizedTalk);
-  if (!payload) {
-    return undefined;
-  }
-
-  if (params.includeSecrets) {
-    return payload;
-  }
+  const realtime: TalkRealtimeConfig | undefined = effectiveRealtime
+    ? {
+        ...configuredPayload?.realtime,
+        ...effectiveRealtime,
+      }
+    : configuredPayload?.realtime;
+  const sourcePayload: TalkConfigResponse = {
+    ...configuredPayload,
+    ...(realtime ? { realtime } : {}),
+  };
+  const payload = params.includeSecrets
+    ? projectTalkSourcePayloadForSecrets(sourcePayload)
+    : sourcePayload;
 
   const sourceResolved = resolveActiveTalkProviderConfig(normalizedTalk);
   const runtimeResolved = resolveActiveTalkProviderConfig(params.runtimeConfig.talk);
@@ -322,34 +536,204 @@ function resolveTalkResponseFromConfig(params: {
   }
 
   const speechProvider = getSpeechProvider(provider, params.runtimeConfig);
-  const sourceBaseTts = asRecord(params.sourceConfig.messages?.tts) ?? {};
-  const runtimeBaseTts = asRecord(params.runtimeConfig.messages?.tts) ?? {};
-  const talkProviderConfig = sourceResolved?.config ?? runtimeResolved?.config ?? {};
+  const sourceBaseTts = withTalkBaseTtsSpeakerSelectionCompat(
+    asOptionalRecord(params.sourceConfig.messages?.tts) ?? {},
+  );
+  const runtimeBaseTts = withTalkBaseTtsSpeakerSelectionCompat(
+    asOptionalRecord(params.runtimeConfig.messages?.tts) ?? {},
+  );
+  const sourceProviderConfig = withSpeakerSelectionFallbackCompat(sourceResolved?.config);
+  const runtimeProviderConfig = withSpeakerSelectionFallbackCompat(runtimeResolved?.config);
+  const selectedBaseTts =
+    Object.keys(runtimeBaseTts).length > 0
+      ? runtimeBaseTts
+      : stripUnresolvedSecretApiKeysFromBaseTtsProviders(sourceBaseTts);
+  // Prefer runtime-resolved provider config and fall back to source. Provider
+  // plugins (ElevenLabs/OpenAI) call strict secret helpers that throw on
+  // unresolved wrappers, so only the already-authorized includeSecrets path may
+  // materialize SecretRef apiKey values before provider resolution. Read-scope
+  // calls keep the old strip/redact behavior.
+  const providerInputConfig = await resolveTalkProviderInputConfig({
+    includeSecrets: params.includeSecrets,
+    config: params.runtimeConfig,
+    providerConfig:
+      Object.keys(runtimeProviderConfig).length > 0 ? runtimeProviderConfig : sourceProviderConfig,
+    provider,
+  });
   const resolvedConfig =
     speechProvider?.resolveTalkConfig?.({
       cfg: params.runtimeConfig,
-      baseTtsConfig: Object.keys(sourceBaseTts).length > 0 ? sourceBaseTts : runtimeBaseTts,
-      talkProviderConfig,
-      timeoutMs:
-        typeof sourceBaseTts.timeoutMs === "number"
-          ? sourceBaseTts.timeoutMs
-          : typeof runtimeBaseTts.timeoutMs === "number"
-            ? runtimeBaseTts.timeoutMs
-            : 30_000,
-    }) ?? talkProviderConfig;
+      baseTtsConfig: selectedBaseTts,
+      talkProviderConfig: providerInputConfig,
+      timeoutMs: typeof selectedBaseTts.timeoutMs === "number" ? selectedBaseTts.timeoutMs : 30_000,
+    }) ?? providerInputConfig;
+  const responseConfig = projectTalkResolvedProviderConfig({
+    includeSecrets: params.includeSecrets,
+    sourceProviderConfig,
+    resolvedConfig,
+  });
 
   return {
     ...payload,
     provider,
     resolved: {
       provider,
-      config: resolvedConfig,
+      config: responseConfig,
     },
   };
 }
 
+function projectTalkResolvedProviderConfig(params: {
+  includeSecrets: boolean;
+  sourceProviderConfig: TalkProviderConfig;
+  resolvedConfig: TalkProviderConfig;
+}): TalkProviderConfig {
+  if (!params.includeSecrets) {
+    return params.sourceProviderConfig.apiKey === undefined
+      ? params.resolvedConfig
+      : { ...params.resolvedConfig, apiKey: params.sourceProviderConfig.apiKey };
+  }
+
+  // includeSecrets authorizes the active Talk provider key only. Keep resolver
+  // defaults in the resolved payload, but do not turn arbitrary provider-owned
+  // secret-like fields into a new native-client credential surface.
+  const projected = redactConfigObject(params.resolvedConfig);
+  const apiKey = normalizeOptionalString(params.resolvedConfig.apiKey);
+  return apiKey === undefined ? projected : { ...projected, apiKey };
+}
+
+function projectTalkSourceProviderConfigForSecrets(config: TalkProviderConfig): TalkProviderConfig {
+  const projected = redactConfigObject(config);
+  if (config.apiKey === undefined || typeof config.apiKey === "string") {
+    return projected;
+  }
+  return { ...projected, apiKey: config.apiKey };
+}
+
+function projectTalkSourceProviderMapForSecrets(
+  providers: Record<string, TalkProviderConfig> | undefined,
+): Record<string, TalkProviderConfig> | undefined {
+  if (!providers) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(providers).map(([providerId, providerConfig]) => [
+      providerId,
+      projectTalkSourceProviderConfigForSecrets(providerConfig),
+    ]),
+  );
+}
+
+function projectTalkRealtimeForSecrets(realtime: TalkRealtimeConfig): TalkRealtimeConfig {
+  const projected = redactConfigObject(realtime);
+  const providers = projectTalkSourceProviderMapForSecrets(realtime.providers);
+  return providers ? { ...projected, providers } : projected;
+}
+
+function projectTalkSourcePayloadForSecrets(payload: TalkConfigResponse): TalkConfigResponse {
+  const projected = redactConfigObject(payload);
+  const providers = projectTalkSourceProviderMapForSecrets(payload.providers);
+  if (providers) {
+    projected.providers = providers;
+  }
+  if (payload.realtime) {
+    projected.realtime = projectTalkRealtimeForSecrets(payload.realtime);
+  }
+  return projected;
+}
+
+async function resolveTalkProviderInputConfig(params: {
+  includeSecrets: boolean;
+  config: OpenClawConfig;
+  providerConfig: TalkProviderConfig;
+  provider: string;
+}): Promise<TalkProviderConfig> {
+  const strippedConfig = stripUnresolvedSecretApiKey(params.providerConfig);
+  if (!params.includeSecrets || params.providerConfig.apiKey === undefined) {
+    return strippedConfig;
+  }
+  const resolved = await resolveConfiguredSecretInputString({
+    config: params.config,
+    env: process.env,
+    value: params.providerConfig.apiKey,
+    path: `talk.providers.${params.provider}.apiKey`,
+  });
+  return resolved.value === undefined
+    ? strippedConfig
+    : { ...params.providerConfig, apiKey: resolved.value };
+}
+
+function stripUnresolvedSecretApiKey(config: TalkProviderConfig): TalkProviderConfig {
+  return stripUnresolvedSecretApiKeyFromRecord(config) as TalkProviderConfig;
+}
+
+function stripUnresolvedSecretApiKeysFromBaseTtsProviders(
+  base: Record<string, unknown>,
+): Record<string, unknown> {
+  const providers = asOptionalRecord(base.providers);
+  if (!providers) {
+    return base;
+  }
+  let mutated = false;
+  // Null-prototype map so an attacker-influenced provider id like `__proto__`,
+  // `constructor`, or `prototype` cannot pollute Object.prototype via the
+  // dynamic `cleaned[providerId] = ...` assignment below. Provider-id keys
+  // come from operator config and may be plain JSON, so we cannot assume
+  // they're already validated upstream.
+  const cleaned: Record<string, unknown> = Object.create(null);
+  for (const [providerId, providerConfig] of Object.entries(providers)) {
+    const cfg = asOptionalRecord(providerConfig);
+    if (!cfg) {
+      cleaned[providerId] = providerConfig;
+      continue;
+    }
+    const next = stripUnresolvedSecretApiKeyFromRecord(cfg);
+    if (next !== cfg) {
+      mutated = true;
+    }
+    cleaned[providerId] = next;
+  }
+  if (!mutated) {
+    return base;
+  }
+  return { ...base, providers: cleaned };
+}
+
+function stripUnresolvedSecretApiKeyFromRecord(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  if (config.apiKey === undefined || typeof config.apiKey === "string") {
+    return config;
+  }
+  const { apiKey: _omit, ...rest } = config;
+  return rest;
+}
+
+/** Gateway request handlers for Talk config, catalog, mode, sessions, and speech. */
 export const talkHandlers: GatewayRequestHandlers = {
-  "talk.config": async ({ params, respond, client }) => {
+  ...talkSessionHandlers,
+  ...talkClientHandlers,
+  "talk.catalog": async ({ params, respond, context }) => {
+    const catalogParams = params ?? {};
+    if (!validateTalkCatalogParams(catalogParams)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `invalid talk.catalog params: ${formatValidationErrors(validateTalkCatalogParams.errors)}`,
+        ),
+      );
+      return;
+    }
+
+    try {
+      respond(true, buildTalkCatalog(context.getRuntimeConfig()), undefined);
+    } catch (err) {
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
+    }
+  },
+  "talk.config": async ({ params, respond, client, context }) => {
     if (!validateTalkConfigParams(params)) {
       respond(
         false,
@@ -373,10 +757,10 @@ export const talkHandlers: GatewayRequestHandlers = {
     }
 
     const snapshot = await readConfigFileSnapshot();
-    const runtimeConfig = loadConfig();
+    const runtimeConfig = context.getRuntimeConfig();
     const configPayload: Record<string, unknown> = {};
 
-    const talk = resolveTalkResponseFromConfig({
+    const talk = await resolveTalkResponseFromConfig({
       includeSecrets,
       sourceConfig: snapshot.config,
       runtimeConfig,
@@ -397,67 +781,7 @@ export const talkHandlers: GatewayRequestHandlers = {
 
     respond(true, { config: configPayload }, undefined);
   },
-  "talk.realtime.session": async ({ params, respond }) => {
-    if (!validateTalkRealtimeSessionParams(params)) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          `invalid talk.realtime.session params: ${formatValidationErrors(validateTalkRealtimeSessionParams.errors)}`,
-        ),
-      );
-      return;
-    }
-    const typedParams = params as {
-      provider?: string;
-      model?: string;
-      voice?: string;
-    };
-    try {
-      const runtimeConfig = loadConfig();
-      const realtimeConfig = buildTalkRealtimeConfig(runtimeConfig, typedParams.provider);
-      const resolution = resolveConfiguredRealtimeVoiceProvider({
-        configuredProviderId: realtimeConfig.provider,
-        providerConfigs: realtimeConfig.providers,
-        cfg: runtimeConfig,
-        cfgForResolve: runtimeConfig,
-        noRegisteredProviderMessage: "No realtime voice provider registered",
-      });
-      if (!resolution.provider.createBrowserSession) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.UNAVAILABLE,
-            `Realtime voice provider "${resolution.provider.id}" does not support browser WebRTC sessions`,
-          ),
-        );
-        return;
-      }
-      const session = await resolution.provider.createBrowserSession({
-        providerConfig: resolution.providerConfig,
-        instructions: buildRealtimeInstructions(),
-        tools: [REALTIME_VOICE_AGENT_CONSULT_TOOL],
-        model: normalizeOptionalString(typedParams.model),
-        voice: normalizeOptionalString(typedParams.voice),
-      });
-      respond(
-        true,
-        {
-          provider: session.provider,
-          clientSecret: session.clientSecret,
-          ...(session.model ? { model: session.model } : {}),
-          ...(session.voice ? { voice: session.voice } : {}),
-          ...(typeof session.expiresAt === "number" ? { expiresAt: session.expiresAt } : {}),
-        },
-        undefined,
-      );
-    } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
-    }
-  },
-  "talk.speak": async ({ params, respond }) => {
+  "talk.speak": async ({ params, respond, context }) => {
     if (!validateTalkSpeakParams(params)) {
       respond(
         false,
@@ -494,7 +818,7 @@ export const talkHandlers: GatewayRequestHandlers = {
     }
 
     try {
-      const runtimeConfig = loadConfig();
+      const runtimeConfig = context.getRuntimeConfig();
       const setup = buildTalkTtsConfig(runtimeConfig);
       if ("error" in setup) {
         respond(false, undefined, talkSpeakError(setup.reason, setup.error));
@@ -555,11 +879,11 @@ export const talkHandlers: GatewayRequestHandlers = {
     }
   },
   "talk.mode": ({ params, respond, context, client, isWebchatConnect }) => {
-    if (client && isWebchatConnect(client.connect) && !context.hasConnectedMobileNode()) {
+    if (client && isWebchatConnect(client.connect) && !context.hasConnectedTalkNode()) {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, "talk disabled: no connected iOS/Android nodes"),
+        errorShape(ErrorCodes.UNAVAILABLE, "talk disabled: no connected Talk-capable nodes"),
       );
       return;
     }

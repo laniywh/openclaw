@@ -1,4 +1,5 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+// Qa Lab plugin module implements live gateway behavior.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   startQaGatewayChild,
   type QaCliBackendAuthMode,
@@ -7,7 +8,7 @@ import {
 import type { QaProviderMode } from "../../model-selection.js";
 import { startQaProviderServer } from "../../providers/server-runtime.js";
 import type { QaThinkingLevel } from "../../qa-gateway-config.js";
-import { appendLiveLaneIssue } from "./live-lane-helpers.js";
+import { appendQaLiveLaneIssue as appendLiveLaneIssue } from "./live-artifacts.js";
 
 async function stopQaLiveLaneResources(
   resources: {
@@ -34,6 +35,52 @@ async function stopQaLiveLaneResources(
   }
 }
 
+function omitMemoryCoreEntry<T extends Record<string, unknown> | undefined>(entries: T): T {
+  if (!entries || !Object.hasOwn(entries, "memory-core")) {
+    return entries;
+  }
+  const { "memory-core": _memoryCore, ...rest } = entries;
+  return rest as T;
+}
+
+function prepareLiveTransportGatewayConfig(cfg: OpenClawConfig): OpenClawConfig {
+  const defaults = cfg.agents?.defaults ?? {};
+  return {
+    ...cfg,
+    plugins: cfg.plugins
+      ? {
+          ...cfg.plugins,
+          allow: cfg.plugins.allow?.filter((pluginId) => pluginId !== "memory-core"),
+          entries: omitMemoryCoreEntry(cfg.plugins.entries),
+          slots: {
+            ...cfg.plugins.slots,
+            memory: "none",
+          },
+        }
+      : {
+          slots: {
+            memory: "none",
+          },
+        },
+    agents: {
+      ...cfg.agents,
+      defaults: {
+        ...defaults,
+        memorySearch: {
+          ...defaults.memorySearch,
+          enabled: false,
+          sync: {
+            ...defaults.memorySearch?.sync,
+            onSearch: false,
+            onSessionStart: false,
+            watch: false,
+          },
+        },
+      },
+    },
+  };
+}
+
 export async function startQaLiveLaneGateway(params: {
   repoRoot: string;
   command?: QaGatewayChildCommand;
@@ -52,6 +99,7 @@ export async function startQaLiveLaneGateway(params: {
   thinkingDefault?: QaThinkingLevel;
   claudeCliAuthMode?: QaCliBackendAuthMode;
   controlUiEnabled?: boolean;
+  mockAuthAgentIds?: readonly string[];
   mutateConfig?: (cfg: OpenClawConfig) => OpenClawConfig;
 }) {
   const mock = await startQaProviderServer(params.providerMode);
@@ -70,7 +118,9 @@ export async function startQaLiveLaneGateway(params: {
       thinkingDefault: params.thinkingDefault,
       claudeCliAuthMode: params.claudeCliAuthMode,
       controlUiEnabled: params.controlUiEnabled,
-      mutateConfig: params.mutateConfig,
+      mockAuthAgentIds: params.mockAuthAgentIds,
+      mutateConfig: (cfg) =>
+        prepareLiveTransportGatewayConfig(params.mutateConfig ? params.mutateConfig(cfg) : cfg),
     });
     return {
       gateway,
@@ -80,7 +130,18 @@ export async function startQaLiveLaneGateway(params: {
       },
     };
   } catch (error) {
-    await mock?.stop().catch(() => {});
+    if (mock) {
+      try {
+        await mock.stop();
+      } catch (cleanupError) {
+        const errors: string[] = [];
+        appendLiveLaneIssue(errors, "gateway startup failed", error);
+        appendLiveLaneIssue(errors, "mock provider stop failed", cleanupError);
+        throw new Error(`failed to start QA live lane gateway:\n${errors.join("\n")}`, {
+          cause: cleanupError,
+        });
+      }
+    }
     throw error;
   }
 }

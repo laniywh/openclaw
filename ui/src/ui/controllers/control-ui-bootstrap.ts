@@ -1,3 +1,4 @@
+// Control UI controller manages control ui bootstrap gateway state.
 import {
   CONTROL_UI_BOOTSTRAP_CONFIG_PATH,
   type ControlUiBootstrapConfig,
@@ -5,8 +6,24 @@ import {
 } from "../../../../src/gateway/control-ui-contract.js";
 import { normalizeAssistantIdentity } from "../assistant-identity.ts";
 import { resolveControlUiAuthCandidates } from "../control-ui-auth.ts";
+import { setUiTimeFormatPreference } from "../format.ts";
 import { normalizeBasePath } from "../navigation.ts";
+import { normalizeAgentId, parseAgentSessionKey } from "../session-key.ts";
 import { loadLocalAssistantIdentity } from "../storage.ts";
+import { normalizeOptionalString } from "../string-coerce.ts";
+
+const SEAM_COLOR_CSS_VARIABLES = [
+  "--ring",
+  "--accent",
+  "--accent-hover",
+  "--accent-muted",
+  "--accent-subtle",
+  "--accent-glow",
+  "--primary",
+  "--focus",
+  "--focus-ring",
+  "--focus-glow",
+] as const;
 
 export type ControlUiBootstrapState = {
   basePath: string;
@@ -20,12 +37,81 @@ export type ControlUiBootstrapState = {
   localMediaPreviewRoots: string[];
   embedSandboxMode: ControlUiEmbedSandboxMode;
   allowExternalEmbedUrls: boolean;
+  chatMessageMaxWidth?: string | null;
+  sessionKey?: string | null;
   hello?: { auth?: { deviceToken?: string | null } | null } | null;
   settings?: { token?: string | null } | null;
   password?: string | null;
 };
 
-export async function loadControlUiBootstrapConfig(state: ControlUiBootstrapState) {
+function normalizeSeamColor(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const hex = value.trim().replace(/^#/, "");
+  return /^[0-9a-fA-F]{6}$/.test(hex) ? `#${hex}` : null;
+}
+
+function applyControlUiSeamColor(value: unknown) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const root = document.documentElement;
+  const color = normalizeSeamColor(value);
+  if (!color) {
+    for (const property of SEAM_COLOR_CSS_VARIABLES) {
+      root.style.removeProperty(property);
+    }
+    return;
+  }
+
+  root.style.setProperty("--ring", color);
+  root.style.setProperty("--accent", color);
+  root.style.setProperty("--accent-hover", "color-mix(in srgb, var(--accent) 82%, white 18%)");
+  root.style.setProperty("--accent-muted", color);
+  root.style.setProperty("--accent-subtle", "color-mix(in srgb, var(--accent) 16%, transparent)");
+  root.style.setProperty("--accent-glow", "color-mix(in srgb, var(--accent) 30%, transparent)");
+  root.style.setProperty("--primary", color);
+  root.style.setProperty("--focus", "color-mix(in srgb, var(--ring) 22%, transparent)");
+  root.style.setProperty(
+    "--focus-ring",
+    "0 0 0 2px var(--bg), 0 0 0 3px color-mix(in srgb, var(--ring) 80%, transparent)",
+  );
+  root.style.setProperty(
+    "--focus-glow",
+    "0 0 0 2px var(--bg), 0 0 0 3px var(--ring), 0 0 16px var(--accent-glow)",
+  );
+}
+
+function resolveActiveAgentId(state: ControlUiBootstrapState): string | null {
+  const sessionAgentId = parseAgentSessionKey(state.sessionKey)?.agentId;
+  if (sessionAgentId) {
+    return normalizeAgentId(sessionAgentId);
+  }
+  const currentAgentId = normalizeOptionalString(state.assistantAgentId);
+  return currentAgentId ? normalizeAgentId(currentAgentId) : null;
+}
+
+function resolveBootstrapAgentId(value: string | null | undefined): string | null {
+  const normalized = normalizeOptionalString(value);
+  return normalized ? normalizeAgentId(normalized) : null;
+}
+
+function applyLocalAssistantAvatarOverride(state: ControlUiBootstrapState) {
+  const localAvatar = loadLocalAssistantIdentity({ agentId: resolveActiveAgentId(state) }).avatar;
+  if (!localAvatar) {
+    return;
+  }
+  state.assistantAvatar = localAvatar;
+  state.assistantAvatarSource = localAvatar;
+  state.assistantAvatarStatus = "data";
+  state.assistantAvatarReason = null;
+}
+
+export async function loadControlUiBootstrapConfig(
+  state: ControlUiBootstrapState,
+  opts?: { applyIdentity?: boolean },
+) {
   if (typeof window === "undefined") {
     return;
   }
@@ -66,27 +152,26 @@ export async function loadControlUiBootstrapConfig(state: ControlUiBootstrapStat
       return;
     }
     const parsed = (await res.json()) as ControlUiBootstrapConfig;
-    const normalized = normalizeAssistantIdentity({
-      agentId: parsed.assistantAgentId ?? null,
-      name: parsed.assistantName,
-      avatar: parsed.assistantAvatar ?? null,
-      avatarSource: parsed.assistantAvatarSource ?? null,
-      avatarStatus: parsed.assistantAvatarStatus ?? null,
-      avatarReason: parsed.assistantAvatarReason ?? null,
-    });
-    state.assistantName = normalized.name;
-    state.assistantAvatar = normalized.avatar;
-    state.assistantAvatarSource = normalized.avatarSource ?? null;
-    state.assistantAvatarStatus = normalized.avatarStatus ?? null;
-    state.assistantAvatarReason = normalized.avatarReason ?? null;
-    state.assistantAgentId = normalized.agentId ?? null;
-    // Local override always wins — same pattern as the user avatar.
-    const localAvatar = loadLocalAssistantIdentity().avatar;
-    if (localAvatar) {
-      state.assistantAvatar = localAvatar;
-      state.assistantAvatarSource = localAvatar;
-      state.assistantAvatarStatus = "data";
-      state.assistantAvatarReason = null;
+    if (opts?.applyIdentity !== false) {
+      const activeAgentId = resolveActiveAgentId(state);
+      const bootstrapAgentId = resolveBootstrapAgentId(parsed.assistantAgentId ?? null);
+      if (!activeAgentId || !bootstrapAgentId || activeAgentId === bootstrapAgentId) {
+        const normalized = normalizeAssistantIdentity({
+          agentId: parsed.assistantAgentId ?? null,
+          name: parsed.assistantName,
+          avatar: parsed.assistantAvatar ?? null,
+          avatarSource: parsed.assistantAvatarSource ?? null,
+          avatarStatus: parsed.assistantAvatarStatus ?? null,
+          avatarReason: parsed.assistantAvatarReason ?? null,
+        });
+        state.assistantName = normalized.name;
+        state.assistantAvatar = normalized.avatar;
+        state.assistantAvatarSource = normalized.avatarSource ?? null;
+        state.assistantAvatarStatus = normalized.avatarStatus ?? null;
+        state.assistantAvatarReason = normalized.avatarReason ?? null;
+        state.assistantAgentId = normalized.agentId ?? null;
+      }
+      applyLocalAssistantAvatarOverride(state);
     }
     state.serverVersion = parsed.serverVersion ?? null;
     state.localMediaPreviewRoots = Array.isArray(parsed.localMediaPreviewRoots)
@@ -99,6 +184,12 @@ export async function loadControlUiBootstrapConfig(state: ControlUiBootstrapStat
           ? "strict"
           : "scripts";
     state.allowExternalEmbedUrls = parsed.allowExternalEmbedUrls === true;
+    state.chatMessageMaxWidth =
+      typeof parsed.chatMessageMaxWidth === "string" && parsed.chatMessageMaxWidth.trim()
+        ? parsed.chatMessageMaxWidth
+        : null;
+    applyControlUiSeamColor(parsed.seamColor);
+    setUiTimeFormatPreference(parsed.timeFormat);
   } catch {
     // Ignore bootstrap failures; UI will update identity after connecting.
   }

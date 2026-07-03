@@ -1,30 +1,26 @@
-import type { OpenClawConfig, ReplyToMode } from "openclaw/plugin-sdk/config-runtime";
+// Discord plugin module implements outbound send context behavior.
+import { createReplyToFanout, type ReplyToResolution } from "openclaw/plugin-sdk/channel-outbound";
 import {
-  createReplyToFanout,
   resolveOutboundSendDep,
-  type ReplyToResolution,
   type OutboundSendDeps,
-} from "openclaw/plugin-sdk/outbound-runtime";
-import { normalizeOptionalStringifiedId } from "openclaw/plugin-sdk/text-runtime";
+} from "openclaw/plugin-sdk/channel-outbound";
+import type { OpenClawConfig, ReplyToMode } from "openclaw/plugin-sdk/config-contracts";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { normalizeOptionalStringifiedId } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { withDiscordDeliveryRetry } from "./delivery-retry.js";
 
 type DiscordSendRuntime = typeof import("./send.js");
 
 export type DiscordSendFn = DiscordSendRuntime["sendMessageDiscord"];
 export type DiscordVoiceSendFn = DiscordSendRuntime["sendVoiceMessageDiscord"];
-export type DiscordFormattingOptions = {
+type DiscordFormattingOptions = {
   textLimit?: number;
   maxLinesPerMessage?: number;
   tableMode?: NonNullable<Parameters<DiscordSendFn>[2]>["tableMode"];
   chunkMode?: NonNullable<Parameters<DiscordSendFn>[2]>["chunkMode"];
 };
 
-let discordSendRuntimePromise: Promise<DiscordSendRuntime> | undefined;
-
-export async function loadDiscordSendRuntime(): Promise<DiscordSendRuntime> {
-  discordSendRuntimePromise ??= import("./send.js");
-  return await discordSendRuntimePromise;
-}
+export const loadDiscordSendRuntime = createLazyRuntimeModule(() => import("./send.js"));
 
 export function resolveDiscordOutboundTarget(params: {
   to: string;

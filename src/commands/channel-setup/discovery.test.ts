@@ -1,3 +1,4 @@
+// Channel setup discovery tests cover visible setup choices from bundled, installed, and trusted catalog sources.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginAutoEnableResult } from "../../config/plugin-auto-enable.js";
 
@@ -18,6 +19,7 @@ const applyPluginAutoEnable = vi.hoisted(() =>
 );
 
 vi.mock("../../plugins/plugin-registry.js", () => ({
+  loadPluginManifestRegistryForPluginRegistry: () => ({ diagnostics: [], plugins: [] }),
   loadPluginRegistrySnapshot: (...args: unknown[]) => loadPluginRegistrySnapshot(...args),
   listPluginContributionIds: (args: unknown) => listPluginContributionIds(args),
 }));
@@ -29,6 +31,7 @@ vi.mock("../../config/plugin-auto-enable.js", () => ({
 
 vi.mock("../../channels/plugins/catalog.js", () => ({
   listChannelPluginCatalogEntries: (_args?: unknown) => listChannelPluginCatalogEntries(),
+  listRawChannelPluginCatalogEntries: (_args?: unknown) => listChannelPluginCatalogEntries(),
 }));
 
 vi.mock("../../channels/chat-meta.js", () => ({
@@ -67,7 +70,7 @@ describe("listManifestInstalledChannelIds", () => {
       },
     });
     loadPluginRegistrySnapshot.mockReturnValue({
-      plugins: [{ pluginId: "slack", contributions: { channels: ["slack"] } }],
+      plugins: [{ pluginId: "slack" }],
       diagnostics: [],
     });
     listPluginContributionIds.mockReturnValue(["slack"]);
@@ -89,11 +92,13 @@ describe("listManifestInstalledChannelIds", () => {
     });
     expect(listPluginContributionIds).toHaveBeenCalledWith({
       index: {
-        plugins: [{ pluginId: "slack", contributions: { channels: ["slack"] } }],
+        plugins: [{ pluginId: "slack" }],
         diagnostics: [],
       },
       contribution: "channels",
       config: autoEnabledConfig,
+      workspaceDir: "/tmp/workspace",
+      env: { OPENCLAW_HOME: "/tmp/home" },
     });
     expect(installedIds).toEqual(new Set(["slack"]));
   });
@@ -156,16 +161,23 @@ describe("listManifestInstalledChannelIds", () => {
       env: { OPENCLAW_HOME: "/tmp/home" } as NodeJS.ProcessEnv,
     });
 
-    expect(resolved.entries).toEqual([
-      expect.objectContaining({
-        id: "telegram",
-        meta: expect.objectContaining({
-          label: "Telegram",
-          selectionLabel: "Telegram",
-          blurb: "bot token",
-          docsPath: "/channels/telegram",
-        }),
-      }),
-    ]);
+    expect(resolved).toStrictEqual({
+      entries: [
+        {
+          id: "telegram",
+          meta: {
+            id: "telegram",
+            label: "Telegram",
+            selectionLabel: "Telegram",
+            blurb: "bot token",
+            docsPath: "/channels/telegram",
+          },
+        },
+      ],
+      installedCatalogEntries: [],
+      installableCatalogEntries: [],
+      installedCatalogById: new Map(),
+      installableCatalogById: new Map(),
+    });
   });
 });

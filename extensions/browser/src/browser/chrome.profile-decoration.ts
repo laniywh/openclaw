@@ -1,5 +1,12 @@
+/**
+ * OpenClaw-managed Chrome profile decoration.
+ *
+ * Applies a stable profile name, color, download directory, and clean-exit
+ * markers to the managed Chrome profile's Local State and Preferences files.
+ */
 import fs from "node:fs";
 import path from "node:path";
+import { loadJsonFile, saveJsonFile } from "openclaw/plugin-sdk/json-store";
 import {
   DEFAULT_OPENCLAW_BROWSER_COLOR,
   DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME,
@@ -10,24 +17,14 @@ function decoratedMarkerPath(userDataDir: string) {
 }
 
 function safeReadJson(filePath: string): Record<string, unknown> | null {
-  try {
-    if (!fs.existsSync(filePath)) {
-      return null;
-    }
-    const raw = fs.readFileSync(filePath, "utf-8");
-    const parsed = JSON.parse(raw) as unknown;
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+  const parsed = loadJsonFile(filePath);
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
 }
 
 function safeWriteJson(filePath: string, data: Record<string, unknown>) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  saveJsonFile(filePath, data);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -41,6 +38,9 @@ function readNestedRecord(root: unknown, key: string): Record<string, unknown> |
 }
 
 function setDeep(obj: Record<string, unknown>, keys: string[], value: unknown) {
+  if (keys.length === 0) {
+    return;
+  }
   let node: Record<string, unknown> = obj;
   for (const key of keys.slice(0, -1)) {
     const next = node[key];
@@ -49,7 +49,7 @@ function setDeep(obj: Record<string, unknown>, keys: string[], value: unknown) {
     }
     node = node[key] as Record<string, unknown>;
   }
-  node[keys[keys.length - 1] ?? ""] = value;
+  node[keys[keys.length - 1]] = value;
 }
 
 function parseHexRgbToSignedArgbInt(hex: string): number | null {
@@ -63,6 +63,7 @@ function parseHexRgbToSignedArgbInt(hex: string): number | null {
   return argbUnsigned > 0x7fffffff ? argbUnsigned - 0x1_0000_0000 : argbUnsigned;
 }
 
+/** Return true when a managed Chrome profile already has desired decoration. */
 export function isProfileDecorated(
   userDataDir: string,
   desiredName: string,
@@ -183,6 +184,7 @@ export function decorateOpenClawProfile(
   }
 }
 
+/** Mark the managed Chrome profile as cleanly exited. */
 export function ensureProfileCleanExit(userDataDir: string) {
   const preferencesPath = path.join(userDataDir, "Default", "Preferences");
   const prefs = safeReadJson(preferencesPath) ?? {};

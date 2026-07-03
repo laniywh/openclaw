@@ -9,108 +9,67 @@ struct GatewayProblemBanner: View {
     var onShowDetails: (() -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: self.iconName)
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(self.tint)
-                    .frame(width: 20)
-                    .padding(.top, 2)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(self.problem.title)
-                            .font(.subheadline.weight(.semibold))
-                            .multilineTextAlignment(.leading)
-                        Spacer(minLength: 0)
-                        Text(self.ownerLabel)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Text(self.problem.message)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if let requestId = self.problem.requestId {
-                        Text("Request ID: \(requestId)")
-                            .font(.system(.caption, design: .monospaced).weight(.medium))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-
-            HStack(spacing: 10) {
-                if let primaryActionTitle, let onPrimaryAction {
-                    Button(primaryActionTitle, action: onPrimaryAction)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                }
-                if let onShowDetails {
-                    Button("Details", action: onShowDetails)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(
-            .thinMaterial,
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-        )
+        OpenClawNoticeBanner(
+            icon: self.iconName,
+            title: self.problem.title,
+            message: self.problem.message,
+            ownerLabel: self.ownerLabel,
+            tint: self.tint,
+            detail: self.problem.requestId.map(OpenClawNoticeDetail.requestID),
+            primaryActionTitle: self.primaryActionTitle,
+            onPrimaryAction: self.onPrimaryAction,
+            secondaryActionTitle: "Details",
+            onSecondaryAction: self.onShowDetails)
     }
 
     private var iconName: String {
         switch self.problem.kind {
         case .pairingRequired,
-            .pairingRoleUpgradeRequired,
-            .pairingScopeUpgradeRequired,
-            .pairingMetadataUpgradeRequired:
-            return "person.crop.circle.badge.clock"
+             .pairingRoleUpgradeRequired,
+             .pairingScopeUpgradeRequired,
+             .pairingMetadataUpgradeRequired:
+            "person.crop.circle.badge.clock"
         case .timeout, .connectionRefused, .reachabilityFailed, .websocketCancelled:
-            return "wifi.exclamationmark"
+            "wifi.exclamationmark"
         case .deviceIdentityRequired,
-            .deviceSignatureExpired,
-            .deviceNonceRequired,
-            .deviceNonceMismatch,
-            .deviceSignatureInvalid,
-            .devicePublicKeyInvalid,
-            .deviceIdMismatch:
-            return "lock.shield"
+             .deviceSignatureExpired,
+             .deviceNonceRequired,
+             .deviceNonceMismatch,
+             .deviceSignatureInvalid,
+             .devicePublicKeyInvalid,
+             .deviceIdMismatch:
+            "lock.shield"
         default:
-            return "exclamationmark.triangle.fill"
+            "exclamationmark.triangle.fill"
         }
     }
 
     private var tint: Color {
         switch self.problem.kind {
         case .pairingRequired,
-            .pairingRoleUpgradeRequired,
-            .pairingScopeUpgradeRequired,
-            .pairingMetadataUpgradeRequired:
-            return .orange
+             .pairingRoleUpgradeRequired,
+             .pairingScopeUpgradeRequired,
+             .pairingMetadataUpgradeRequired:
+            OpenClawBrand.warn
         case .timeout, .connectionRefused, .reachabilityFailed, .websocketCancelled:
-            return .yellow
+            OpenClawBrand.warn
         default:
-            return .red
+            OpenClawBrand.danger
         }
     }
 
     private var ownerLabel: String {
         switch self.problem.owner {
         case .gateway:
-            return "Fix on gateway"
+            "Fix on gateway"
         case .iphone:
-            return "Fix on iPhone"
+            "Fix on this device"
         case .both:
-            return "Check both"
+            "Check both"
         case .network:
-            return "Check network"
+            "Check network"
         case .unknown:
-            return "Needs attention"
+            "Needs attention"
         }
     }
 }
@@ -218,15 +177,15 @@ struct GatewayProblemDetailsSheet: View {
     private var ownerSummary: String {
         switch self.problem.owner {
         case .gateway:
-            return "Primary fix: gateway"
+            "Primary fix: gateway"
         case .iphone:
-            return "Primary fix: this iPhone"
+            "Primary fix: this device"
         case .both:
-            return "Primary fix: check both this iPhone and the gateway"
+            "Primary fix: check both this device and the gateway"
         case .network:
-            return "Primary fix: network or remote access"
+            "Primary fix: network or remote access"
         case .unknown:
-            return "Primary fix: review details and retry"
+            "Primary fix: review details and retry"
         }
     }
 }

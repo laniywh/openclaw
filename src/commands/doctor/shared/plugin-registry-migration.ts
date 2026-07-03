@@ -1,9 +1,12 @@
+// Doctor migration from legacy shipped plugin install config into persisted install registry.
 import fs from "node:fs";
-import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import {
-  loadPluginInstallRecords,
-  writePersistedPluginInstallLedger,
-} from "../../../plugins/install-ledger-store.js";
+  extractShippedPluginInstallConfigRecords,
+  stripShippedPluginInstallConfigRecords,
+} from "../../../config/plugin-install-config-migration.js";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { loadInstalledPluginIndexInstallRecords } from "../../../plugins/installed-plugin-index-records.js";
 import {
   inspectPersistedInstalledPluginIndex,
   readPersistedInstalledPluginIndexSync,
@@ -13,14 +16,19 @@ import {
   type InstalledPluginIndexStoreOptions,
 } from "../../../plugins/installed-plugin-index-store.js";
 import {
-  listEnabledInstalledPluginRecords,
   loadInstalledPluginIndex,
   type InstalledPluginIndex,
+  type InstalledPluginIndexRecord,
   type LoadInstalledPluginIndexParams,
 } from "../../../plugins/installed-plugin-index.js";
+import { loadPluginManifestRegistryForInstalledIndex } from "../../../plugins/manifest-registry-installed.js";
+import type { PluginManifestRecord } from "../../../plugins/manifest-registry.js";
 
 export const DISABLE_PLUGIN_REGISTRY_MIGRATION_ENV = "OPENCLAW_DISABLE_PLUGIN_REGISTRY_MIGRATION";
 export const FORCE_PLUGIN_REGISTRY_MIGRATION_ENV = "OPENCLAW_FORCE_PLUGIN_REGISTRY_MIGRATION";
+const DOCTOR_PLUGIN_ID_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  openai: ["openai-codex"],
+};
 
 export type PluginRegistryInstallMigrationPreflightAction =
   | "disabled"
@@ -28,9 +36,13 @@ export type PluginRegistryInstallMigrationPreflightAction =
   | "migrate";
 
 export type PluginRegistryInstallMigrationPreflight = {
+  /** Migration action selected before reading or writing registry state. */
   action: PluginRegistryInstallMigrationPreflightAction;
+  /** Persisted plugin index path that migration will inspect or write. */
   filePath: string;
+  /** True when deprecated force env requested migration despite existing registry. */
   force: boolean;
+  /** Deprecation warnings for env toggles that should be shown to users. */
   deprecationWarnings: readonly string[];
 };
 
@@ -56,13 +68,15 @@ export type PluginRegistryInstallMigrationParams = LoadInstalledPluginIndexParam
   };
 
 function hasEnvFlag(env: NodeJS.ProcessEnv | undefined, key: string): boolean {
-  return Boolean(env?.[key]?.trim());
+  const value = env?.[key]?.trim().toLowerCase();
+  return Boolean(value && value !== "0" && value !== "false" && value !== "no");
 }
 
 function forceDeprecationWarning(): string {
   return `${FORCE_PLUGIN_REGISTRY_MIGRATION_ENV} is deprecated and will be removed after the plugin registry migration rollout; use doctor registry repair once available.`;
 }
 
+/** Decide whether plugin install registry migration should run for this environment. */
 export function preflightPluginRegistryInstallMigration(
   params: PluginRegistryInstallMigrationParams = {},
 ): PluginRegistryInstallMigrationPreflight {
@@ -111,6 +125,169 @@ async function readMigrationConfig(
   return await configModule.readBestEffortConfig();
 }
 
+function normalizeRegistryReference(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed.toLowerCase() : undefined;
+}
+
+function createMigrationPluginIdNormalizer(
+  index: InstalledPluginIndex,
+  manifests: readonly PluginManifestRecord[],
+): (pluginId: string) => string {
+  const aliases = new Map<string, string>();
+  for (const plugin of index.plugins) {
+    const pluginId = normalizeRegistryReference(plugin.pluginId);
+    if (!pluginId) {
+      continue;
+    }
+    aliases.set(pluginId, plugin.pluginId);
+  }
+  for (const plugin of manifests) {
+    const pluginId = normalizeRegistryReference(plugin.id);
+    if (!pluginId) {
+      continue;
+    }
+    aliases.set(pluginId, plugin.id);
+    for (const alias of [
+      ...plugin.providers,
+      ...plugin.channels,
+      ...(plugin.setup?.providers?.map((provider) => provider.id) ?? []),
+      ...plugin.cliBackends,
+      ...(plugin.setup?.cliBackends ?? []),
+      ...Object.keys(plugin.modelCatalog?.providers ?? {}),
+      ...(plugin.legacyPluginIds ?? []),
+      ...(DOCTOR_PLUGIN_ID_ALIASES[plugin.id] ?? []),
+    ]) {
+      const normalizedAlias = normalizeRegistryReference(alias);
+      if (normalizedAlias && !aliases.has(normalizedAlias)) {
+        aliases.set(normalizedAlias, plugin.id);
+      }
+    }
+  }
+  return (pluginId: string) => {
+    const normalized = normalizeRegistryReference(pluginId);
+    return normalized ? (aliases.get(normalized) ?? pluginId.trim()) : pluginId.trim();
+  };
+}
+
+function addPluginReference(
+  references: Set<string>,
+  normalizePluginId: (pluginId: string) => string,
+  value: unknown,
+): void {
+  if (typeof value !== "string") {
+    return;
+  }
+  const normalized = normalizePluginId(value);
+  if (normalized) {
+    references.add(normalized);
+  }
+}
+
+function listConfiguredChannelIds(config: OpenClawConfig): Set<string> {
+  const channels = config.channels;
+  if (!channels || typeof channels !== "object" || Array.isArray(channels)) {
+    return new Set();
+  }
+  return new Set(
+    Object.keys(channels)
+      .map((channelId) => normalizeRegistryReference(channelId))
+      .filter((channelId): channelId is string => Boolean(channelId)),
+  );
+}
+
+function listConfiguredModelProviderIds(config: OpenClawConfig): Set<string> {
+  const providers = config.models?.providers;
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+    return new Set();
+  }
+  return new Set(
+    Object.keys(providers)
+      .map((providerId) => normalizeProviderId(providerId))
+      .filter(Boolean),
+  );
+}
+
+function listMigrationRelevantPluginRecords(params: {
+  index: InstalledPluginIndex;
+  config: OpenClawConfig;
+  installRecords: Record<string, unknown>;
+  workspaceDir?: string;
+  env?: NodeJS.ProcessEnv;
+}): readonly InstalledPluginIndexRecord[] {
+  const manifestRegistry = loadPluginManifestRegistryForInstalledIndex({
+    index: params.index,
+    config: params.config,
+    workspaceDir: params.workspaceDir,
+    env: params.env,
+    includeDisabled: true,
+  });
+  const manifestByPluginId = new Map(manifestRegistry.plugins.map((plugin) => [plugin.id, plugin]));
+  const normalizePluginId = createMigrationPluginIdNormalizer(
+    params.index,
+    manifestRegistry.plugins,
+  );
+  const referencedPluginIds = new Set<string>();
+  const installedPluginIds = new Set<string>();
+
+  for (const pluginId of Object.keys(params.installRecords)) {
+    addPluginReference(installedPluginIds, normalizePluginId, pluginId);
+  }
+
+  const plugins = params.config.plugins;
+  for (const pluginId of plugins?.allow ?? []) {
+    addPluginReference(referencedPluginIds, normalizePluginId, pluginId);
+  }
+  for (const pluginId of plugins?.deny ?? []) {
+    addPluginReference(referencedPluginIds, normalizePluginId, pluginId);
+  }
+  for (const pluginId of Object.keys(plugins?.entries ?? {})) {
+    addPluginReference(referencedPluginIds, normalizePluginId, pluginId);
+  }
+  for (const pluginId of Object.values(plugins?.slots ?? {})) {
+    if (normalizeRegistryReference(pluginId) === "none") {
+      continue;
+    }
+    addPluginReference(referencedPluginIds, normalizePluginId, pluginId);
+  }
+
+  const configuredChannelIds = listConfiguredChannelIds(params.config);
+  const configuredModelProviderIds = listConfiguredModelProviderIds(params.config);
+
+  return params.index.plugins.filter((plugin) => {
+    if (plugin.origin !== "bundled") {
+      return true;
+    }
+    const manifest = manifestByPluginId.get(plugin.pluginId);
+    if (plugin.enabledByDefault && (manifest?.providers.length ?? 0) > 0) {
+      return true;
+    }
+    if (plugin.startup.memory) {
+      return true;
+    }
+    if ((manifest?.commandAliases ?? []).some((alias) => alias.cliCommand)) {
+      return true;
+    }
+    if (installedPluginIds.has(plugin.pluginId) || referencedPluginIds.has(plugin.pluginId)) {
+      return true;
+    }
+    if (
+      (manifest?.channels ?? []).some((channelId) =>
+        configuredChannelIds.has(normalizeRegistryReference(channelId) ?? ""),
+      )
+    ) {
+      return true;
+    }
+    return (manifest?.providers ?? []).some((providerId) =>
+      configuredModelProviderIds.has(normalizeProviderId(providerId)),
+    );
+  });
+}
+
+/** Persist a migrated plugin install registry from legacy config/install records when needed. */
 export async function migratePluginRegistryForInstall(
   params: PluginRegistryInstallMigrationParams = {},
 ): Promise<PluginRegistryInstallMigrationResult> {
@@ -125,25 +302,34 @@ export async function migratePluginRegistryForInstall(
     return { status: "dry-run", migrated: false, preflight };
   }
 
-  const config = await readMigrationConfig(params);
-  const installRecords = await loadPluginInstallRecords({ ...params, config });
+  const rawConfig = await readMigrationConfig(params);
+  const config = stripShippedPluginInstallConfigRecords(rawConfig) as OpenClawConfig;
+  const durableInstallRecords =
+    params.installRecords ?? (await loadInstalledPluginIndexInstallRecords(params));
+  const installRecords = {
+    ...extractShippedPluginInstallConfigRecords(rawConfig),
+    ...durableInstallRecords,
+  };
   const migrationParams = {
     ...params,
     config,
+    installRecords,
   };
   const inspection = await inspectPersistedInstalledPluginIndex(migrationParams);
   const candidateIndex = loadInstalledPluginIndex({
     ...migrationParams,
-    cache: false,
   });
   const current: InstalledPluginIndex = {
     ...candidateIndex,
     refreshReason: "migration",
-    plugins: listEnabledInstalledPluginRecords(candidateIndex, config),
+    plugins: listMigrationRelevantPluginRecords({
+      index: candidateIndex,
+      config,
+      installRecords,
+      workspaceDir: params.workspaceDir,
+      env: params.env,
+    }),
   };
-  if (Object.keys(installRecords).length > 0) {
-    await writePersistedPluginInstallLedger(installRecords, params);
-  }
   await writePersistedInstalledPluginIndex(current, params);
   return {
     status: "migrated",

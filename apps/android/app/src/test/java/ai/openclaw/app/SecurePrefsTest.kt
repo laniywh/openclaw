@@ -16,7 +16,11 @@ class SecurePrefsTest {
   fun loadLocationMode_migratesLegacyAlwaysValue() {
     val context = RuntimeEnvironment.getApplication()
     val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
-    plainPrefs.edit().clear().putString("location.enabledMode", "always").commit()
+    plainPrefs
+      .edit()
+      .clear()
+      .putString("location.enabledMode", "always")
+      .commit()
 
     val prefs = SecurePrefs(context)
 
@@ -28,7 +32,11 @@ class SecurePrefsTest {
   fun voiceMicEnabled_ignoresOldTalkEnabledKey() {
     val context = RuntimeEnvironment.getApplication()
     val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
-    plainPrefs.edit().clear().putBoolean("talk.enabled", true).commit()
+    plainPrefs
+      .edit()
+      .clear()
+      .putBoolean("talk.enabled", true)
+      .commit()
 
     val prefs = SecurePrefs(context)
 
@@ -40,7 +48,11 @@ class SecurePrefsTest {
   fun setVoiceMicEnabled_persistsNewKeyOnly() {
     val context = RuntimeEnvironment.getApplication()
     val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
-    plainPrefs.edit().clear().putBoolean("talk.enabled", false).commit()
+    plainPrefs
+      .edit()
+      .clear()
+      .putBoolean("talk.enabled", false)
+      .commit()
     val prefs = SecurePrefs(context)
 
     prefs.setVoiceMicEnabled(true)
@@ -48,6 +60,77 @@ class SecurePrefsTest {
     assertTrue(prefs.voiceMicEnabled.value)
     assertTrue(plainPrefs.getBoolean("voice.micEnabled", false))
     assertFalse(plainPrefs.getBoolean("talk.enabled", false))
+  }
+
+  @Test
+  fun installedAppsSharing_defaultsOffAndPersistsOptIn() {
+    val context = RuntimeEnvironment.getApplication()
+    val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
+    plainPrefs.edit().clear().commit()
+    val prefs = SecurePrefs(context)
+
+    assertFalse(prefs.installedAppsSharingEnabled.value)
+
+    prefs.setInstalledAppsSharingEnabled(true)
+
+    assertTrue(prefs.installedAppsSharingEnabled.value)
+    assertTrue(plainPrefs.getBoolean("device.apps.sharing.enabled", false))
+  }
+
+  @Test
+  fun cameraSharing_defaultsOffAndPersistsOptIn() {
+    val context = RuntimeEnvironment.getApplication()
+    val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
+    plainPrefs.edit().clear().commit()
+    val prefs = SecurePrefs(context)
+
+    assertFalse(prefs.cameraEnabled.value)
+    assertFalse(plainPrefs.getBoolean("camera.enabled", true))
+
+    prefs.setCameraEnabled(true)
+
+    assertTrue(prefs.cameraEnabled.value)
+    assertTrue(plainPrefs.getBoolean("camera.enabled", false))
+  }
+
+  @Test
+  fun cameraSharing_migratesExistingInstallsToPreviousDefault() {
+    val context = RuntimeEnvironment.getApplication()
+    val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
+    plainPrefs
+      .edit()
+      .clear()
+      .putString("node.instanceId", "existing-node")
+      .commit()
+    val prefs = SecurePrefs(context)
+
+    assertTrue(prefs.cameraEnabled.value)
+    assertTrue(plainPrefs.getBoolean("camera.enabled", false))
+  }
+
+  @Test
+  fun appearanceThemeMode_defaultsDarkForExistingInstalls() {
+    val context = RuntimeEnvironment.getApplication()
+    val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
+    plainPrefs.edit().clear().commit()
+    val prefs = SecurePrefs(context)
+
+    assertEquals(AppearanceThemeMode.Dark, prefs.appearanceThemeMode.value)
+    assertFalse(plainPrefs.contains("appearance.themeMode"))
+  }
+
+  @Test
+  fun setAppearanceThemeMode_persistsSelectedMode() {
+    val context = RuntimeEnvironment.getApplication()
+    val plainPrefs = context.getSharedPreferences("openclaw.node", Context.MODE_PRIVATE)
+    plainPrefs.edit().clear().commit()
+    val prefs = SecurePrefs(context)
+
+    prefs.setAppearanceThemeMode(AppearanceThemeMode.Light)
+
+    assertEquals(AppearanceThemeMode.Light, prefs.appearanceThemeMode.value)
+    assertEquals("light", plainPrefs.getString("appearance.themeMode", null))
+    assertEquals(AppearanceThemeMode.Light, SecurePrefs(context).appearanceThemeMode.value)
   }
 
   @Test

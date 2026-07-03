@@ -4,9 +4,16 @@
 
 /** Union type for items in the chat thread */
 export type ChatItem =
-  | { kind: "message"; key: string; message: unknown }
-  | { kind: "divider"; key: string; label: string; timestamp: number }
-  | { kind: "stream"; key: string; text: string; startedAt: number }
+  | { kind: "message"; key: string; message: unknown; duplicateCount?: number }
+  | {
+      kind: "divider";
+      key: string;
+      label: string;
+      description?: string;
+      action?: { kind: "session-checkpoints"; label: string };
+      timestamp: number;
+    }
+  | { kind: "stream"; key: string; text: string; startedAt: number; isStreaming: boolean }
   | { kind: "reading-indicator"; key: string };
 
 /** A group of consecutive messages from the same role (Slack-style layout) */
@@ -15,9 +22,14 @@ export type MessageGroup = {
   key: string;
   role: string;
   senderLabel?: string | null;
-  messages: Array<{ message: unknown; key: string }>;
+  messages: Array<{ message: unknown; key: string; duplicateCount?: number }>;
   timestamp: number;
   isStreaming: boolean;
+  // Tool groups only: true when the turn still produced a successful assistant
+  // reply, so a failed internal tool (Codex marks any non-zero exit as failed)
+  // renders collapsed instead of as a primary red error banner. Undefined for
+  // non-tool groups and for terminal/in-progress tool failures.
+  turnSucceeded?: boolean;
 };
 
 /** Content item types in a normalized message */
@@ -70,6 +82,8 @@ export type ToolCard = {
   args?: unknown;
   inputText?: string;
   outputText?: string;
+  isError?: boolean;
+  messageId?: string;
   preview?: {
     kind: "canvas";
     surface: "assistant_message";

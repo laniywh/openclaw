@@ -3,6 +3,35 @@ import SwiftUI
 import UIKit
 #endif
 
+enum ChatReaderUserTransition: Equatable {
+    case unchanged
+    case added(UUID)
+    case removed(latestRemainingID: UUID?)
+}
+
+func chatReaderUserTransition(
+    previousID: UUID?,
+    visibleIDs: [UUID]) -> ChatReaderUserTransition
+{
+    let latestID = visibleIDs.last
+    if let previousID, !visibleIDs.contains(previousID) {
+        return .removed(latestRemainingID: latestID)
+    }
+    if let latestID, latestID != previousID {
+        return .added(latestID)
+    }
+    return .unchanged
+}
+
+func chatReaderHasNewerContent(
+    after messageID: UUID,
+    visibleIDs: [UUID],
+    hasTransientContent: Bool) -> Bool
+{
+    guard let messageIndex = visibleIDs.firstIndex(of: messageID) else { return false }
+    return messageIndex < visibleIDs.index(before: visibleIDs.endIndex) || hasTransientContent
+}
+
 @MainActor
 public struct OpenClawChatView: View {
     public enum Style {
@@ -10,18 +39,42 @@ public struct OpenClawChatView: View {
         case onboarding
     }
 
+    public enum ComposerChrome {
+        case full
+        case clean
+    }
+
     @State private var viewModel: OpenClawChatViewModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var scrollerBottomID = UUID()
     @State private var scrollPosition: UUID?
     @State private var showSessions = false
     @State private var hasPerformedInitialScroll = false
-    @State private var isPinnedToBottom = true
     @State private var lastUserMessageID: UUID?
+    @State private var hasNewerContentBelow = false
+    @State private var followTarget: ScrollFollowTarget? = .latest
+    @State private var isAtLiveEdge = true
+    @State private var isUserScrolling = false
     private let showsSessionSwitcher: Bool
+    private let drawsBackground: Bool
     private let style: Style
     private let markdownVariant: ChatMarkdownVariant
     private let userAccent: Color?
     private let showsAssistantTrace: Bool
+    private let assistantName: String?
+    private let assistantAvatarText: String?
+    private let assistantAvatarTint: Color?
+    private let showsAssistantAvatars: Bool
+    private let composerChrome: ComposerChrome
+    private let isComposerEnabled: Bool
+    private let messagePlaceholder: String?
+    private let emptyAssistantIntro: String?
+    private let talkControl: OpenClawChatTalkControl?
+
+    private enum ScrollFollowTarget: Equatable {
+        case latest
+        case user(UUID)
+    }
 
     private enum Layout {
         #if os(macOS)
@@ -33,6 +86,8 @@ public struct OpenClawChatView: View {
         static let messageListPaddingTop: CGFloat = 12
         static let messageListPaddingBottom: CGFloat = 16
         static let messageListPaddingHorizontal: CGFloat = 6
+        static let newTurnAnchor = UnitPoint(x: 0.5, y: 0.18)
+        static let liveEdgeThreshold: CGFloat = 48
         #else
         static let outerPaddingHorizontal: CGFloat = 6
         static let outerPaddingVertical: CGFloat = 6
@@ -42,54 +97,105 @@ public struct OpenClawChatView: View {
         static let messageListPaddingTop: CGFloat = 10
         static let messageListPaddingBottom: CGFloat = 6
         static let messageListPaddingHorizontal: CGFloat = 8
+        static let newTurnAnchor = UnitPoint(x: 0.5, y: 0.18)
+        static let liveEdgeThreshold: CGFloat = 48
         #endif
     }
 
     public init(
         viewModel: OpenClawChatViewModel,
+        drawsBackground: Bool = true,
         showsSessionSwitcher: Bool = false,
         style: Style = .standard,
         markdownVariant: ChatMarkdownVariant = .standard,
         userAccent: Color? = nil,
-        showsAssistantTrace: Bool = false)
+        showsAssistantTrace: Bool = false,
+        assistantName: String? = nil,
+        assistantAvatarText: String? = nil,
+        assistantAvatarTint: Color? = nil,
+        showsAssistantAvatars: Bool = true,
+        composerChrome: ComposerChrome = .full,
+        isComposerEnabled: Bool = true,
+        messagePlaceholder: String? = nil,
+        emptyAssistantIntro: String? = nil,
+        talkControl: OpenClawChatTalkControl? = nil)
     {
         self._viewModel = State(initialValue: viewModel)
+        self.drawsBackground = drawsBackground
         self.showsSessionSwitcher = showsSessionSwitcher
         self.style = style
         self.markdownVariant = markdownVariant
         self.userAccent = userAccent
         self.showsAssistantTrace = showsAssistantTrace
+        self.assistantName = assistantName
+        self.assistantAvatarText = assistantAvatarText
+        self.assistantAvatarTint = assistantAvatarTint
+        self.showsAssistantAvatars = showsAssistantAvatars
+        self.composerChrome = composerChrome
+        self.isComposerEnabled = isComposerEnabled
+        self.messagePlaceholder = messagePlaceholder
+        self.emptyAssistantIntro = emptyAssistantIntro
+        self.talkControl = talkControl
     }
 
     public var body: some View {
         ZStack {
-            if self.style == .standard {
+            if self.drawsBackground, self.style == .standard {
                 OpenClawChatTheme.background
                     .ignoresSafeArea()
             }
 
-            VStack(spacing: Layout.stackSpacing) {
-                self.messageList
-                    .padding(.horizontal, Layout.outerPaddingHorizontal)
-                OpenClawChatComposer(
-                    viewModel: self.viewModel,
-                    style: self.style,
-                    showsSessionSwitcher: self.showsSessionSwitcher)
-                    .padding(.horizontal, Layout.composerPaddingHorizontal)
-            }
-            .padding(.vertical, Layout.outerPaddingVertical)
-            .frame(maxWidth: .infinity)
-            .frame(maxHeight: .infinity, alignment: .top)
+            self.content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear { self.viewModel.load() }
         .sheet(isPresented: self.$showSessions) {
             if self.showsSessionSwitcher {
                 ChatSessionsSheet(viewModel: self.viewModel)
-            } else {
-                EmptyView()
             }
         }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        #if os(macOS)
+        VStack(spacing: Layout.stackSpacing) {
+            self.messageList
+                .padding(.horizontal, Layout.outerPaddingHorizontal)
+            self.composer
+                .padding(.horizontal, Layout.composerPaddingHorizontal)
+        }
+        .padding(.vertical, Layout.outerPaddingVertical)
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: .infinity, alignment: .top)
+        #else
+        VStack(spacing: 0) {
+            self.messageList
+                .padding(.horizontal, Layout.outerPaddingHorizontal)
+            self.composer
+                .padding(.horizontal, Layout.composerPaddingHorizontal)
+                .padding(.top, Layout.stackSpacing)
+                .padding(.bottom, Layout.outerPaddingVertical)
+        }
+        .padding(.top, Layout.outerPaddingVertical)
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: .infinity, alignment: .top)
+        #endif
+    }
+
+    private var composer: some View {
+        OpenClawChatComposer(
+            viewModel: self.viewModel,
+            style: self.style,
+            showsSessionSwitcher: self.showsSessionSwitcher,
+            userAccent: self.userAccent,
+            assistantName: self.assistantName,
+            assistantAvatarText: self.assistantAvatarText,
+            assistantAvatarTint: self.assistantAvatarTint,
+            composerChrome: self.composerChrome,
+            isComposerEnabled: self.isComposerEnabled,
+            messagePlaceholder: self.messagePlaceholder,
+            talkControl: self.talkControl)
     }
 
     private var messageList: some View {
@@ -99,11 +205,11 @@ public struct OpenClawChatView: View {
                     self.messageListRows
 
                     Color.clear
-                        #if os(macOS)
+                    #if os(macOS)
                         .frame(height: Layout.messageListPaddingBottom)
-                        #else
+                    #else
                         .frame(height: Layout.messageListPaddingBottom + 1)
-                        #endif
+                    #endif
                         .id(self.scrollerBottomID)
                 }
                 // Use scroll targets for stable auto-scroll without ScrollViewReader relayout glitches.
@@ -114,20 +220,51 @@ public struct OpenClawChatView: View {
             #if !os(macOS)
             .scrollDismissesKeyboard(.interactively)
             #endif
-            // Keep the scroll pinned to the bottom for new messages.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                self.messageListNoticeBanner
+            }
             .scrollPosition(id: self.$scrollPosition, anchor: .bottom)
-            .onChange(of: self.scrollPosition) { _, position in
-                guard let position else { return }
-                self.isPinnedToBottom = position == self.scrollerBottomID
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                let distanceFromBottom = geometry.contentSize.height - geometry.visibleRect.maxY
+                return distanceFromBottom <= Layout.liveEdgeThreshold
+            } action: { _, isAtLiveEdge in
+                self.isAtLiveEdge = isAtLiveEdge
+                guard self.hasPerformedInitialScroll else { return }
+                if isAtLiveEdge, !self.isUserScrolling, !self.isFollowingUserTurn {
+                    self.followTarget = .latest
+                    self.hasNewerContentBelow = false
+                }
+            }
+            .onScrollPhaseChange { _, phase in
+                guard self.hasPerformedInitialScroll else { return }
+                if phase == .interacting {
+                    self.isUserScrolling = true
+                    self.followTarget = nil
+                } else if phase == .idle, self.isUserScrolling {
+                    self.isUserScrolling = false
+                    if self.isAtLiveEdge {
+                        self.followTarget = .latest
+                        self.hasNewerContentBelow = false
+                    } else {
+                        self.hasNewerContentBelow = true
+                    }
+                }
             }
 
-            if self.viewModel.isLoading {
+            if self.viewModel.isLoading, self.composerChrome == .full {
                 ProgressView()
                     .controlSize(.large)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             self.messageListOverlay
+
+            if self.showsJumpToLatest {
+                self.jumpToLatestButton
+                    .padding(.bottom, 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         // Ensure the message list claims vertical space on the first layout pass.
         .frame(maxHeight: .infinity, alignment: .top)
@@ -138,78 +275,83 @@ public struct OpenClawChatView: View {
             })
         .onChange(of: self.viewModel.isLoading) { _, isLoading in
             guard !isLoading, !self.hasPerformedInitialScroll else { return }
-            self.scrollPosition = self.scrollerBottomID
+            self.restoreInitialScrollPosition()
             self.hasPerformedInitialScroll = true
-            self.isPinnedToBottom = true
+            self.lastUserMessageID = self.latestVisibleUserMessageID
         }
         .onChange(of: self.viewModel.sessionKey) { _, _ in
             self.hasPerformedInitialScroll = false
-            self.isPinnedToBottom = true
+            self.followTarget = .latest
+            self.isAtLiveEdge = true
+            self.isUserScrolling = false
+            self.hasNewerContentBelow = false
+            self.lastUserMessageID = nil
         }
-        .onChange(of: self.viewModel.isSending) { _, isSending in
-            // Scroll to bottom when user sends a message, even if scrolled up.
-            guard isSending, self.hasPerformedInitialScroll else { return }
-            self.isPinnedToBottom = true
-            withAnimation(.snappy(duration: 0.22)) {
-                self.scrollPosition = self.scrollerBottomID
-            }
+        .onChange(of: self.scenePhase) { _, newValue in
+            guard newValue == .active else { return }
+            self.viewModel.resumeFromForeground()
         }
-        .onChange(of: self.viewModel.messages.count) { _, _ in
-            guard self.hasPerformedInitialScroll else { return }
-            if let lastMessage = self.viewModel.messages.last,
-               lastMessage.role.lowercased() == "user",
-               lastMessage.id != self.lastUserMessageID {
-                self.lastUserMessageID = lastMessage.id
-                self.isPinnedToBottom = true
-                withAnimation(.snappy(duration: 0.22)) {
-                    self.scrollPosition = self.scrollerBottomID
-                }
-                return
-            }
-
-            guard self.isPinnedToBottom else { return }
-            withAnimation(.snappy(duration: 0.22)) {
-                self.scrollPosition = self.scrollerBottomID
-            }
-        }
-        .onChange(of: self.viewModel.pendingRunCount) { _, _ in
-            guard self.hasPerformedInitialScroll, self.isPinnedToBottom else { return }
-            withAnimation(.snappy(duration: 0.22)) {
-                self.scrollPosition = self.scrollerBottomID
-            }
-        }
-        .onChange(of: self.viewModel.streamingAssistantText) { _, _ in
-            guard self.hasPerformedInitialScroll, self.isPinnedToBottom else { return }
-            withAnimation(.snappy(duration: 0.22)) {
-                self.scrollPosition = self.scrollerBottomID
-            }
+        .onChange(of: self.viewModel.timelineRevision) { _, _ in
+            self.handleTimelineChange()
         }
     }
 
     @ViewBuilder
     private var messageListRows: some View {
+        if let introText = self.visibleEmptyAssistantIntro {
+            ChatAssistantIntroCard(text: introText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        if self.showsCleanLoadingPlaceholder {
+            ChatLoadingBubble()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        if let error = self.inlineCleanErrorText {
+            let presentation = self.errorPresentation(for: error)
+            ChatNoticeCard(
+                systemImage: presentation.systemImage,
+                title: presentation.title,
+                message: error,
+                tint: presentation.tint,
+                actionTitle: "Refresh",
+                action: { self.viewModel.refresh() })
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
         ForEach(self.visibleMessages) { msg in
             ChatMessageBubble(
                 message: msg,
                 style: self.style,
                 markdownVariant: self.markdownVariant,
                 userAccent: self.userAccent,
-                showsAssistantTrace: self.showsAssistantTrace)
+                showsAssistantTrace: self.showsAssistantTrace,
+                assistantName: self.assistantName,
+                assistantAvatarText: self.assistantAvatarText,
+                assistantAvatarTint: self.assistantAvatarTint,
+                showsAssistantAvatar: self.showsAssistantAvatars,
+                isClean: self.composerChrome == .clean)
                 .frame(
                     maxWidth: .infinity,
                     alignment: msg.role.lowercased() == "user" ? .trailing : .leading)
         }
 
         if self.viewModel.pendingRunCount > 0 {
-            HStack {
-                ChatTypingIndicatorBubble(style: self.style)
-                    .equatable()
-                Spacer(minLength: 0)
-            }
+            ChatTypingIndicatorBubble(
+                style: self.style,
+                assistantName: self.assistantName,
+                assistantAvatarText: self.assistantAvatarText,
+                assistantAvatarTint: self.assistantAvatarTint,
+                showsAssistantAvatar: self.showsAssistantAvatars,
+                isClean: self.composerChrome == .clean)
+                .equatable()
         }
 
         if !self.viewModel.pendingToolCalls.isEmpty {
-            ChatPendingToolsBubble(toolCalls: self.viewModel.pendingToolCalls)
+            ChatPendingToolsBubble(
+                toolCalls: self.viewModel.pendingToolCalls,
+                isClean: self.composerChrome == .clean)
                 .equatable()
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -220,7 +362,12 @@ public struct OpenClawChatView: View {
             ChatStreamingAssistantBubble(
                 text: text,
                 markdownVariant: self.markdownVariant,
-                showsAssistantTrace: self.showsAssistantTrace)
+                showsAssistantTrace: self.showsAssistantTrace,
+                assistantName: self.assistantName,
+                assistantAvatarText: self.assistantAvatarText,
+                assistantAvatarTint: self.assistantAvatarTint,
+                showsAssistantAvatar: self.showsAssistantAvatars,
+                isClean: self.composerChrome == .clean)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -237,27 +384,64 @@ public struct OpenClawChatView: View {
         return self.mergeToolResults(in: base).filter(self.shouldDisplayMessage(_:))
     }
 
+    private var latestVisibleUserMessageID: UUID? {
+        self.visibleUserMessageIDs.last
+    }
+
+    private var visibleUserMessageIDs: [UUID] {
+        self.visibleMessages.compactMap { message in
+            message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "user"
+                ? message.id
+                : nil
+        }
+    }
+
+    private var isFollowingUserTurn: Bool {
+        if case .user = self.followTarget {
+            return true
+        }
+        return false
+    }
+
+    private var showsJumpToLatest: Bool {
+        self.hasNewerContentBelow && self.hasVisibleMessageListContent && !self.viewModel.isLoading
+    }
+
+    private var jumpToLatestButton: some View {
+        Button {
+            self.followTarget = .latest
+            self.hasNewerContentBelow = false
+            self.moveScrollPosition(to: self.scrollerBottomID)
+        } label: {
+            Label("Jump to latest", systemImage: "arrow.down")
+                .font(.callout.weight(.semibold))
+                .padding(.horizontal, 13)
+                .padding(.vertical, 8)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(OpenClawChatTheme.assistantText)
+        .background(
+            Capsule()
+                .fill(OpenClawChatTheme.subtleCard)
+                .shadow(color: .black.opacity(0.16), radius: 10, y: 4))
+        .accessibilityLabel("Jump to latest reply")
+    }
+
     @ViewBuilder
     private var messageListOverlay: some View {
         if self.viewModel.isLoading {
             EmptyView()
+        } else if self.composerChrome == .clean, self.visibleEmptyAssistantIntro != nil {
+            EmptyView()
+        } else if self.showsCleanLoadingPlaceholder {
+            EmptyView()
+        } else if self.inlineCleanErrorText != nil {
+            EmptyView()
         } else if let error = self.activeErrorText {
-            let presentation = self.errorPresentation(for: error)
             if self.hasVisibleMessageListContent {
-                VStack(spacing: 0) {
-                    ChatNoticeBanner(
-                        systemImage: presentation.systemImage,
-                        title: presentation.title,
-                        message: error,
-                        tint: presentation.tint,
-                        dismiss: { self.viewModel.errorText = nil },
-                        refresh: { self.viewModel.refresh() })
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 10)
-                .padding(.top, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                EmptyView()
             } else {
+                let presentation = self.errorPresentation(for: error)
                 ChatNoticeCard(
                     systemImage: presentation.systemImage,
                     title: presentation.title,
@@ -273,7 +457,7 @@ public struct OpenClawChatView: View {
                 systemImage: "bubble.left.and.bubble.right.fill",
                 title: self.emptyStateTitle,
                 message: self.emptyStateMessage,
-                tint: .accentColor,
+                tint: OpenClawChatTheme.accent,
                 actionTitle: nil,
                 action: nil)
                 .padding(.horizontal, 24)
@@ -291,22 +475,73 @@ public struct OpenClawChatView: View {
         return text
     }
 
+    private var inlineCleanErrorText: String? {
+        guard self.composerChrome == .clean, !self.hasVisibleMessageListContent else {
+            return nil
+        }
+        return self.activeErrorText
+    }
+
     private var hasVisibleMessageListContent: Bool {
         if !self.visibleMessages.isEmpty {
             return true
         }
-        if let text = self.viewModel.streamingAssistantText,
-           AssistantTextParser.hasVisibleContent(in: text, includeThinking: self.showsAssistantTrace)
+        return self.hasVisibleTransientContent
+    }
+
+    private var hasVisibleTransientContent: Bool {
+        self.viewModel.pendingRunCount > 0 ||
+            !self.viewModel.pendingToolCalls.isEmpty ||
+            (self.viewModel.streamingAssistantText.map {
+                AssistantTextParser.hasVisibleContent(in: $0, includeThinking: self.showsAssistantTrace)
+            } ?? false)
+    }
+
+    @ViewBuilder
+    private var messageListNoticeBanner: some View {
+        if let error = self.activeErrorText,
+           self.hasVisibleMessageListContent,
+           !self.viewModel.isLoading,
+           self.visibleEmptyAssistantIntro == nil,
+           !self.showsCleanLoadingPlaceholder
         {
-            return true
+            let presentation = self.errorPresentation(for: error)
+            ChatNoticeBanner(
+                systemImage: presentation.systemImage,
+                title: presentation.title,
+                message: error,
+                tint: presentation.tint,
+                dismiss: { self.viewModel.errorText = nil },
+                refresh: { self.viewModel.refresh() })
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
         }
-        if self.viewModel.pendingRunCount > 0 {
-            return true
+    }
+
+    private var showsCleanLoadingPlaceholder: Bool {
+        self.composerChrome == .clean &&
+            self.viewModel.isLoading &&
+            self.visibleEmptyAssistantIntro == nil &&
+            self.activeErrorText == nil &&
+            !self.hasVisibleMessageListContent
+    }
+
+    private var visibleEmptyAssistantIntro: String? {
+        guard self.composerChrome == .clean,
+              self.showsEmptyState,
+              !self.viewModel.isLoading,
+              self.activeErrorText == nil,
+              self.isComposerEnabled
+        else {
+            return nil
         }
-        if !self.viewModel.pendingToolCalls.isEmpty {
-            return true
+        guard let text = self.emptyAssistantIntro?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty
+        else {
+            return nil
         }
-        return false
+        return text
     }
 
     private var showsEmptyState: Bool {
@@ -343,6 +578,96 @@ public struct OpenClawChatView: View {
             return ("Timed out", "clock.badge.exclamationmark", .orange)
         }
         return ("Error", "exclamationmark.triangle.fill", .orange)
+    }
+
+    private func restoreInitialScrollPosition() {
+        if let latestUserMessageID = self.latestVisibleUserMessageID {
+            self.followTarget = nil
+            self.hasNewerContentBelow = chatReaderHasNewerContent(
+                after: latestUserMessageID,
+                visibleIDs: self.visibleMessages.map(\.id),
+                hasTransientContent: self.hasVisibleTransientContent)
+            self.moveScrollPosition(to: latestUserMessageID, anchor: Layout.newTurnAnchor)
+        } else {
+            self.followTarget = .latest
+            self.hasNewerContentBelow = false
+            self.moveScrollPosition(to: self.scrollerBottomID)
+        }
+    }
+
+    private func handleTimelineChange() {
+        guard self.hasPerformedInitialScroll else { return }
+        if self.viewModel.messages.isEmpty,
+           self.viewModel.pendingRunCount == 0,
+           self.viewModel.pendingToolCalls.isEmpty,
+           self.viewModel.streamingAssistantText == nil
+        {
+            self.lastUserMessageID = nil
+            self.followTarget = .latest
+            self.hasNewerContentBelow = false
+            self.moveScrollPosition(to: self.scrollerBottomID)
+            return
+        }
+        let visibleMessages = self.visibleMessages
+        let visibleUserMessageIDs = visibleMessages.compactMap { message in
+            message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "user"
+                ? message.id
+                : nil
+        }
+        switch chatReaderUserTransition(
+            previousID: self.lastUserMessageID,
+            visibleIDs: visibleUserMessageIDs)
+        {
+        case let .removed(latestRemainingID):
+            self.lastUserMessageID = latestRemainingID
+            if case let .user(messageID) = self.followTarget,
+               !visibleUserMessageIDs.contains(messageID)
+            {
+                self.followTarget = nil
+                self.hasNewerContentBelow = false
+            }
+            return
+        case let .added(latestUserMessageID):
+            self.lastUserMessageID = latestUserMessageID
+            self.followTarget = .user(latestUserMessageID)
+            self.hasNewerContentBelow = false
+            self.moveScrollPosition(to: latestUserMessageID, anchor: Layout.newTurnAnchor)
+            return
+        case .unchanged:
+            break
+        }
+
+        switch self.followTarget {
+        case .latest:
+            self.hasNewerContentBelow = false
+            self.moveScrollPosition(to: self.scrollerBottomID)
+        case let .user(messageID):
+            // Reader policy stays on this turn after the one-shot scroll binding is released. Reissuing
+            // that target for every streaming delta can loop SwiftUI layout and starve interaction.
+            self.hasNewerContentBelow = chatReaderHasNewerContent(
+                after: messageID,
+                visibleIDs: visibleMessages.map(\.id),
+                hasTransientContent: self.hasVisibleTransientContent)
+        case nil:
+            self.hasNewerContentBelow = true
+        }
+    }
+
+    private func moveScrollPosition(
+        to id: UUID,
+        anchor: UnitPoint = .bottom)
+    {
+        var transaction = Transaction(animation: nil)
+        transaction.scrollTargetAnchor = anchor
+        withTransaction(transaction) {
+            self.scrollPosition = id
+        }
+        DispatchQueue.main.async {
+            guard self.scrollPosition == id else { return }
+            // Reader policy lives in followTarget. The binding is only a one-shot positioning request;
+            // keeping an overflowing transcript bound to any row can loop SwiftUI scroll layout.
+            self.scrollPosition = nil
+        }
     }
 
     private func mergeToolResults(in messages: [OpenClawChatMessage]) -> [OpenClawChatMessage] {
@@ -390,7 +715,8 @@ public struct OpenClawChatView: View {
                 toolCallId: last.toolCallId,
                 toolName: last.toolName,
                 usage: last.usage,
-                stopReason: last.stopReason)
+                stopReason: last.stopReason,
+                errorMessage: last.errorMessage)
             result[result.count - 1] = merged
         }
 
@@ -434,7 +760,11 @@ public struct OpenClawChatView: View {
             guard kind == "text" || kind.isEmpty else { return nil }
             return content.text
         }
-        return parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return OpenClawChatMessage.displayText(
+            contentText: parts.joined(separator: "\n"),
+            role: message.role,
+            stopReason: message.stopReason,
+            errorMessage: message.errorMessage)
     }
 
     private func hasInlineAttachments(in message: OpenClawChatMessage) -> Bool {
@@ -493,6 +823,46 @@ public struct OpenClawChatView: View {
     }
 }
 
+private struct ChatAssistantIntroCard: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: "sparkles")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(OpenClawChatTheme.accent)
+                .accessibilityHidden(true)
+
+            Text(self.text)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(OpenClawChatTheme.assistantText)
+                .multilineTextAlignment(.leading)
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: 320, alignment: .leading)
+        .padding(.top, 8)
+    }
+}
+
+private struct ChatLoadingBubble: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Loading chat")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 12)
+        .background(
+            Capsule()
+                .fill(OpenClawChatTheme.subtleCard))
+        .padding(.leading, 10)
+    }
+}
+
 private struct ChatNoticeCard: View {
     let systemImage: String
     let title: String
@@ -502,25 +872,25 @@ private struct ChatNoticeCard: View {
     let action: (() -> Void)?
 
     var body: some View {
-        VStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(self.tint.opacity(0.16))
-                Image(systemName: self.systemImage)
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(self.tint)
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: self.systemImage)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(self.tint)
+                .frame(width: 42, height: 42)
+                .background(self.tint.opacity(0.14), in: Circle())
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(self.title)
+                    .font(.headline)
+
+                Text(self.message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(3)
             }
-            .frame(width: 52, height: 52)
 
-            Text(self.title)
-                .font(.headline)
-
-            Text(self.message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .lineLimit(4)
-                .frame(maxWidth: 360)
+            Spacer(minLength: 8)
 
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
@@ -528,14 +898,14 @@ private struct ChatNoticeCard: View {
                     .controlSize(.small)
             }
         }
-        .padding(18)
+        .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(OpenClawChatTheme.subtleCard)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)))
-        .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)))
+        .shadow(color: .black.opacity(0.12), radius: 14, y: 7)
     }
 }
 

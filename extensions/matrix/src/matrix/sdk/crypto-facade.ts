@@ -1,3 +1,6 @@
+// Matrix plugin module implements crypto facade behavior.
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { ensureMatrixCryptoRuntime } from "../deps.js";
 import type { MatrixRecoveryKeyStore } from "./recovery-key-store.js";
 import type { EncryptedFile } from "./types.js";
 import type {
@@ -65,12 +68,24 @@ export type MatrixCryptoFacade = {
 };
 
 type MatrixCryptoNodeRuntime = typeof import("./crypto-node.runtime.js");
-let matrixCryptoNodeRuntimePromise: Promise<MatrixCryptoNodeRuntime> | null = null;
+const matrixCryptoNodeRuntimeLoader = createLazyRuntimeModule(
+  () => import("./crypto-node.runtime.js"),
+);
 
 async function loadMatrixCryptoNodeRuntime(): Promise<MatrixCryptoNodeRuntime> {
   // Keep the native crypto package out of the main CLI startup graph.
-  matrixCryptoNodeRuntimePromise ??= import("./crypto-node.runtime.js");
-  return await matrixCryptoNodeRuntimePromise;
+  try {
+    return await matrixCryptoNodeRuntimeLoader();
+  } catch (error) {
+    matrixCryptoNodeRuntimeLoader.clear();
+    throw error;
+  }
+}
+
+async function loadMatrixCryptoNodeBindings() {
+  await ensureMatrixCryptoRuntime();
+  const runtime = await loadMatrixCryptoNodeRuntime();
+  return runtime.loadMatrixCryptoNodeBindings();
 }
 
 function trackInProgressToDeviceVerifications(deps: {
@@ -133,7 +148,7 @@ export function createMatrixCryptoFacade(deps: {
     encryptMedia: async (
       buffer: Buffer,
     ): Promise<{ buffer: Buffer; file: Omit<EncryptedFile, "url"> }> => {
-      const { Attachment } = await loadMatrixCryptoNodeRuntime();
+      const { Attachment } = await loadMatrixCryptoNodeBindings();
       const encrypted = Attachment.encrypt(new Uint8Array(buffer));
       const mediaInfoJson = encrypted.mediaEncryptionInfo;
       if (!mediaInfoJson) {
@@ -154,8 +169,8 @@ export function createMatrixCryptoFacade(deps: {
       file: EncryptedFile,
       opts?: { maxBytes?: number; readIdleTimeoutMs?: number },
     ): Promise<Buffer> => {
-      const { Attachment, EncryptedAttachment } = await loadMatrixCryptoNodeRuntime();
       const encrypted = await deps.downloadContent(file.url, opts);
+      const { Attachment, EncryptedAttachment } = await loadMatrixCryptoNodeBindings();
       const metadata: EncryptedFile = {
         url: file.url,
         key: file.key,
